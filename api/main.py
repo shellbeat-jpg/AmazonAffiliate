@@ -171,33 +171,77 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
 
     for record in root.findall(".//{*}record"):
         title = ""
+        description = ""
+        edition = ""
+        series = ""
+        contributors = []
+        isbn = ""
+        place = ""
         year = ""
         pages = ""
-        dnb_id = ""
+        dnb_id = ""   
 
         persons = []
         publisher = None
 
+        # 001
         dnb_control = record.find("./{*}controlfield[@tag='001']")
         if dnb_control is not None and dnb_control.text:
             dnb_id = dnb_control.text.strip()
-
+        
+        # 245$a title, 245$b subtitle/desc
         title_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='a']")
         if title_field is not None and title_field.text:
             title = title_field.text.strip(" /:")
-
+        
+        desc_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='b']")
+        if desc_field is not None and desc_field.text:
+            description = desc_field.text.strip(" /:")
+        
+        # 250$a edition
+        edition_field = record.find("./{*}datafield[@tag='250']/{*}subfield[@code='a']")
+        if edition_field is not None and edition_field.text:
+            edition = edition_field.text.strip(" /:")
+        
+        # 490$a series
+        series_field = record.find("./{*}datafield[@tag='490']/{*}subfield[@code='a']")
+        if series_field is not None and series_field.text:
+            series = series_field.text.strip(" /:")
+        
+        # ISBN 020$a
+        isbn_field = record.find("./{*}datafield[@tag='020']/{*}subfield[@code='a']")
+        if isbn_field is not None and isbn_field.text:
+            isbn = isbn_field.text.strip().split(" ")[0]
+        
+        # pages 300$a
         pages_field = record.find("./{*}datafield[@tag='300']/{*}subfield[@code='a']")
         if pages_field is not None and pages_field.text:
             pages = pages_field.text.strip()
-
-        year_field = record.find("./{*}datafield[@tag='264']/{*}subfield[@code='c']")
-        if year_field is None:
-            year_field = record.find("./{*}datafield[@tag='260']/{*}subfield[@code='c']")
-        if year_field is not None and year_field.text:
-            m = re.search(r'(\d{4})', year_field.text)
-            if m:
-                year = m.group(1)
-
+        
+        # 264 (fallback 260): place/publisher/year
+        pub_field = record.find("./{*}datafield[@tag='264']")
+        if pub_field is None:
+            pub_field = record.find("./{*}datafield[@tag='260']")
+        
+        if pub_field is not None:
+            place_el = pub_field.find("./{*}subfield[@code='a']")
+            if place_el is not None and place_el.text:
+                place = place_el.text.strip(" ,;:")
+        
+            pub_name_el = pub_field.find("./{*}subfield[@code='b']")
+            if pub_name_el is not None and pub_name_el.text:
+                publisher = {
+                    "name": pub_name_el.text.strip(" ,;:"),
+                    "gnd_id": extract_gnd_id(pub_field),
+                }
+        
+            year_el = pub_field.find("./{*}subfield[@code='c']")
+            if year_el is not None and year_el.text:
+                m = re.search(r"(\d{4})", year_el.text)
+                if m:
+                    year = m.group(1)
+        
+        # authors 100 + contributors 700
         for field in record.findall("./{*}datafield[@tag='100']"):
             name_el = field.find("./{*}subfield[@code='a']")
             if name_el is not None and name_el.text:
@@ -210,16 +254,18 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
                     "role": "autor",
                     "is_primary_author": True,
                 })
-
+        
         for field in record.findall("./{*}datafield[@tag='700']"):
             name_el = field.find("./{*}subfield[@code='a']")
             if name_el is not None and name_el.text:
+                cname = name_el.text.strip()
+                contributors.append(cname)
                 role = "mitwirkender"
                 rel = field.find("./{*}subfield[@code='4']")
                 if rel is not None and rel.text:
                     role = rel.text.strip()
                 persons.append({
-                    "name": name_el.text.strip(),
+                    "name": cname,
                     "gnd_id": extract_gnd_id(field),
                     "birth_death": (field.find("./{*}subfield[@code='d']").text.strip()
                                     if field.find("./{*}subfield[@code='d']") is not None
@@ -227,36 +273,46 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
                     "role": role,
                     "is_primary_author": False,
                 })
-
-        pub_field = record.find("./{*}datafield[@tag='264']")
-        if pub_field is None:
-            pub_field = record.find("./{*}datafield[@tag='260']")
-        if pub_field is not None:
-            pub_name_el = pub_field.find("./{*}subfield[@code='b']")
-            if pub_name_el is not None and pub_name_el.text:
-                publisher = {
-                    "name": pub_name_el.text.strip(" ,;:"),
-                    "gnd_id": extract_gnd_id(pub_field),
-                }
-
-        # base64-kodierte Rohdaten für Import-Button
+        
+        persons_text = ", ".join([p["name"] for p in persons if p.get("name")]) if persons else "–"
+        publisher_text = publisher["name"] if publisher else "–"
+        
+        # FILTER: skip incomplete placeholder rows
+        has_core = bool(title.strip()) and (
+            bool(persons) or bool(place.strip()) or bool(year.strip()) or bool(isbn.strip())
+        )
+        if not has_core:
+            continue
+        
         payload = {
             "dnb_id": dnb_id,
             "title": title,
+            "description": description,
+            "edition": edition,
+            "series": series,
+            "contributors": contributors,
+            "isbn": isbn,
+            "place": place,
             "year": year,
             "pages": pages,
             "persons": persons,
             "publisher": publisher,
         }
         data_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
-
+        
         results.append({
             "dnb_id": dnb_id,
             "title": title,
+            "description": description,
+            "edition": edition,
+            "series": series,
+            "contributors": contributors,
+            "isbn": isbn,
+            "place": place,
             "year": year,
             "pages": pages,
-            "persons_text": ", ".join([p["name"] for p in persons]) if persons else "–",
-            "publisher_text": publisher["name"] if publisher else "–",
+            "persons_text": persons_text,
+            "publisher_text": publisher_text,
             "data_b64": data_b64,
         })
 
