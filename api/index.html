@@ -87,11 +87,20 @@
                     <tr>
                         <td><input type="checkbox" name="selected_data" value="{{ rec.data_b64 }}"></td>
                         <td>{{ rec.dnb_id }}</td>
-                        <td>{{ rec.title }}</td>
-                        <td>{{ rec.persons_text }}</td>
+                        <td>               
+                          <b>{{ rec.title }}</b><br>
+                          <small style="color:#666">{{ rec.description }}</small>
+                          {% if rec.edition %}<br><small style="color:#999">Ausgabe: {{ rec.edition }}</small>{% endif %}
+                          {% if rec.series %}<br><small style="color:#999">Reihe: {{ rec.series }}</small>{% endif %}
+                          {% if rec.contributors and rec.contributors|length > 0 %}
+                            <br><small style="color:#999">Mitwirkende: {{ rec.contributors|join(", ") }}</small>
+                          {% endif %}
+                          {% if rec.isbn %}<br><small style="color:#999">ISBN: {{ rec.isbn }}</small>{% endif %}
+                        </td>                           
+                        <td>{{ rec.persons_text }}</td>  
                         <td>{{ rec.year }}</td>
-                        <td>{{ rec.pages }}</td>
-                        <td>{{ rec.publisher_text }}</td>
+                        <td>{{ rec.pages }}</td>                                                
+                        <td>{{ rec.publisher_text }}{% if rec.place and rec.publisher_text %}, {% endif %}{{ rec.place }}</td>   
                     </tr>
                     {% endfor %}
                 </tbody>
