@@ -172,6 +172,7 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
     for record in root.findall(".//{*}record"):
         title = ""
         description = ""
+        raw_description = ""
         edition = ""
         series = ""
         contributors = []
@@ -179,8 +180,7 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
         place = ""
         year = ""
         pages = ""
-        dnb_id = ""   
-
+        dnb_id = ""
         persons = []
         publisher = None
 
@@ -188,15 +188,23 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
         dnb_control = record.find("./{*}controlfield[@tag='001']")
         if dnb_control is not None and dnb_control.text:
             dnb_id = dnb_control.text.strip()
-        
+
         # 245$a title, 245$b subtitle/desc
         title_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='a']")
         if title_field is not None and title_field.text:
             title = title_field.text.strip(" /:")
-        
+            
+        # 245$a description
         desc_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='b']")
         if desc_field is not None and desc_field.text:
             description = desc_field.text.strip(" /:")
+        
+        # 520$a raw_description
+        raw_desc_el = record.find("./{*}datafield[@tag='520']/{*}subfield[@code='a']")
+        if raw_desc_el is not None and raw_desc_el.text:
+            raw_description = raw_desc_el.text.strip()
+        elif description:
+            raw_description = description
         
         # 250$a edition
         edition_field = record.find("./{*}datafield[@tag='250']/{*}subfield[@code='a']")
