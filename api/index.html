@@ -12,13 +12,14 @@
         button { padding: 9px 20px; background: #0055aa; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
         table { width: 100%; border-collapse: collapse; background: white; margin-top: 10px; }
         th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 14px; }
-        th { background-color: #0055aa; color: white; cursor: pointer; }
+        th { background-color: #0055aa; color: white; cursor: pointer; user-select: none; }
         .local-table th { background-color: #2e7d32; }
         tr:hover { background-color: #f8fafc; }
-        .btn-import { padding: 4px 8px; background: #2e7d32; color: white; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; }
+        .btn-import { padding: 8px 14px; background: #2e7d32; color: white; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; border: none; cursor: pointer; }
         .price { font-weight: bold; color: #2e7d32; }
         .key { font-family: monospace; font-size: 11px; background: #e0e0e0; padding: 2px 4px; border-radius: 3px; }
         .debug-url { background: #ffebee; border: 1px dashed #c62828; padding: 10px; border-radius: 4px; font-family: monospace; word-break: break-all; color: #c62828; font-size: 13px; }
+        .toolbar { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
     </style>
 </head>
 <body>
@@ -29,73 +30,139 @@
             <div class="form-group"><label>Titel</label><input type="text" name="title" value="{{ title }}"></div>
             <div class="form-group"><label>Jahr von</label><input type="number" name="year_start" value="{{ year_start }}"></div>
             <div class="form-group"><label>Jahr bis</label><input type="number" name="year_end" value="{{ year_end }}"></div>
-            <button type="submit">DNB durchsuchen</button>
+            <div class="form-group"><label>Max Treffer</label><input type="number" name="max_records" value="{{ max_records }}"></div>
+            <div class="form-group"><label>&nbsp;</label><button type="submit">Live suchen</button></div>
         </form>
-        <table id="dnbTable">
+
+        {% if debug_url %}
+        <div class="debug-url"><strong>DNB API URL:</strong><br>{{ debug_url }}</div>
+        {% endif %}
+    </div>
+
+    <div class="box">
+        <h2>📦 2. DNB-Suchergebnisse (Mehrfachauswahl + Import)</h2>
+        <form method="post" action="/import">
+            <input type="hidden" name="redirect_author" value="{{ author }}">
+            <input type="hidden" name="redirect_title" value="{{ title }}">
+            <input type="hidden" name="redirect_year_start" value="{{ year_start }}">
+            <input type="hidden" name="redirect_year_end" value="{{ year_end }}">
+            <input type="hidden" name="redirect_max_records" value="{{ max_records }}">
+
+            <div class="toolbar">
+                <button class="btn-import" type="submit">Auswahl speichern (POST)</button>
+            </div>
+
+            <table id="searchResultsTable">
+                <thead>
+                    <tr>
+                        <th data-type="string">Auswahl</th>
+                        <th data-type="string">DNB-ID</th>
+                        <th data-type="string">Titel</th>
+                        <th data-type="string">Autoren</th>
+                        <th data-type="number">Jahr</th>
+                        <th data-type="number">Seiten</th>
+                        <th data-type="string">Verlag</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rec in search_results %}
+                    <tr>
+                        <td><input type="checkbox" name="selected_data" value="{{ rec.data_b64 }}"></td>
+                        <td>{{ rec.dnb_id }}</td>
+                        <td>{{ rec.title }}</td>
+                        <td>{{ rec.persons_text }}</td>
+                        <td>{{ rec.year }}</td>
+                        <td>{{ rec.pages }}</td>
+                        <td>{{ rec.publisher_text }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </form>
+    </div>
+
+    <div class="box">
+        <h2 class="local">🗄️ 3. Lokale Datenbank (PostgreSQL)</h2>
+        <table id="localDbTable" class="local-table">
             <thead>
                 <tr>
-                    <th>DNB-ID</th><th>Titel & Beschreibung</th><th>Autor</th><th>Ort, Jahr</th><th>Umfang</th><th>Aktion</th>
+                    <th data-type="number">ID</th>
+                    <th data-type="string">Titel</th>
+                    <th data-type="string">Autoren</th>
+                    <th data-type="number">Jahr</th>
+                    <th data-type="string">Matching-Key</th>
+                    <th data-type="number">Preis (€)</th>
                 </tr>
             </thead>
             <tbody>
-                {% if dnb_results %}
-                    {% for b in dnb_results %}
-                    <tr>
-                        <td>{{ b.id }}</td>
-                        <td>
-                            <b>{{ b.title }}</b><br>
-                            <small style="color:#666">{{ b.description }}</small>
-                            {% if b.edition %}<br><small style="color:#999">Ausgabe: {{ b.edition }}</small>{% endif %}
-                            {% if b.series %}<br><small style="color:#999">Reihe: {{ b.series }}</small>{% endif %}
-                            {% if b.contributors %}<br><small style="color:#999">Mitwirkende: {{ b.contributors|join(", ") }}</small>{% endif %}
-                            {% if b.isbn %}<br><small style="color:#999">ISBN: {{ b.isbn }}</small>{% endif %}
-                        </td>
-                        <td>{{ b.author }}</td>
-                        <td>{{ b.place }}{% if b.place and b.year %}, {% endif %}{{ b.year }}</td>
-                        <td>{{ b.pages }}</td>
-                        <td><a class="btn-import" href="/import?data={{ b.import_payload }}">+ In DB speichern</a></td>
-                    </tr>
-                    {% endfor %}
-                {% else %}
-                    <tr>
-                        <td colspan="6" style="padding: 20px;">
-                            <strong>Keine Suchergebnisse geliefert.</strong><br><br>
-                            Verwendete DNB-Schnittstellen-URL für die Abfrage:<br>
-                            <div class="debug-url">
-                                {% if generated_url %}
-                                    <a href="{{ generated_url }}" target="_blank" style="color: #c62828;">{{ generated_url }}</a>
-                                {% else %}
-                                    Noch keine Abfrage gestartet. Bitte Suchmaske ausfüllen.
-                                {% endif %}
-                            </div>
-                        </td>
-                    </tr>
-                {% endif %}
+                {% for b in db_books %}
+                <tr>
+                    <td>{{ b[0] }}</td>
+                    <td>{{ b[1] }}</td>
+                    <td>{{ b[2] }}</td>
+                    <td>{{ b[3] }}</td>
+                    <td><span class="key">{{ b[4] }}</span></td>
+                    <td class="price">{{ b[5] }}</td>
+                </tr>
+                {% endfor %}
             </tbody>
         </table>
     </div>
 
-    <div class="box">
-        <h2 class="local">🗄️ 2. Permanenter Bestand (PostgreSQL DB auf SSD)</h2>
-        <table id="localTable" class="local-table">
-            <thead>
-                <tr>
-                    <th>DB-ID</th><th>Titel</th><th>Autor</th><th>Jahr</th><th>Fuzzy-Key</th><th>Preis</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% if local_books %}
-                    {% for b in local_books %}
-                    <tr>
-                        <td>{{ b[0] }}</td><td><b>{{ b[1] }}</b></td><td>{{ b[2] }}</td><td>{{ b[3] }}</td>
-                        <td><span class="key">{{ b[4] }}</span></td><td class="price">{{ b[5] }} &euro;</td>
-                    </tr>
-                    {% endfor %}
-                {% else %}
-                    <tr><td colspan="6" style="text-align:center; color:#999;">Datenbank leer.</td></tr>
-                {% endif %}
-            </tbody>
-        </table>
-    </div>
+    <script>
+        function parseNumberLike(text) {
+            if (!text) return Number.NEGATIVE_INFINITY;
+            const cleaned = String(text).replace(',', '.');
+            const match = cleaned.match(/-?\d+(\.\d+)?/);
+            if (!match) return Number.NEGATIVE_INFINITY;
+            const n = Number(match[0]);
+            return Number.isNaN(n) ? Number.NEGATIVE_INFINITY : n;
+        }
+
+        function makeTableSortable(tableId) {
+            const table = document.getElementById(tableId);
+            if (!table) return;
+
+            const headers = table.querySelectorAll('thead th');
+            const tbody = table.querySelector('tbody');
+            const sortState = {};
+
+            headers.forEach((th, colIndex) => {
+                th.addEventListener('click', () => {
+                    const type = th.dataset.type || 'string';
+                    const rows = Array.from(tbody.querySelectorAll('tr'));
+
+                    // Checkbox-Spalte nicht sinnvoll sortieren
+                    if (colIndex === 0 && tableId === 'searchResultsTable') {
+                        return;
+                    }
+
+                    const nextDir = sortState[colIndex] === 'asc' ? 'desc' : 'asc';
+                    sortState[colIndex] = nextDir;
+
+                    rows.sort((a, b) => {
+                        const aText = (a.children[colIndex]?.innerText || '').trim();
+                        const bText = (b.children[colIndex]?.innerText || '').trim();
+
+                        let cmp = 0;
+                        if (type === 'number') {
+                            const aNum = parseNumberLike(aText);
+                            const bNum = parseNumberLike(bText);
+                            cmp = aNum - bNum;
+                        } else {
+                            cmp = aText.localeCompare(bText, 'de', { sensitivity: 'base' });
+                        }
+
+                        return nextDir === 'asc' ? cmp : -cmp;
+                    });
+
+                    rows.forEach(r => tbody.appendChild(r));
+                });
+            });
+        }
+
+        makeTableSortable('searchResultsTable');
+        makeTableSortable('localDbTable');
+    </script>
 </body>
 </html>

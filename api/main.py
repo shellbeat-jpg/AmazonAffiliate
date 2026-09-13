@@ -3,7 +3,8 @@ import re
 import json
 import base64
 from pathlib import Path
-from fastapi import FastAPI, Query, Request
+from urllib.parse import urlencode
+from fastapi import FastAPI, Query, Request, Form
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 import requests
@@ -88,212 +89,167 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
 
     start_valid = year_start and year_start.strip()
     end_valid = year_end and year_end.strip()
+
     if start_valid and end_valid:
-        cql_parts.append(f'JHR>={year_start.strip()} and JHR<={year_end.strip()}')
+        cql_parts.append(f'JHR within "{year_start.strip()} {year_end.strip()}"')
     elif start_valid:
-        cql_parts.append(f'JHR>={year_start.strip()}')
+        cql_parts.append(f'JHR>="{year_start.strip()}"')
     elif end_valid:
-        cql_parts.append(f'JHR<={year_end.strip()}')
+        cql_parts.append(f'JHR<="{year_end.strip()}"')
 
-    query_string = " and ".join(cql_parts)
+    cql_query = " and ".join(cql_parts)
 
-    url = "https://services.dnb.de/sru/dnb"
     params = {
         "version": "1.1",
         "operation": "searchRetrieve",
+        "query": cql_query,
         "recordSchema": "MARC21-xml",
         "maximumRecords": max_records,
-        "query": query_string
     }
 
-    req = requests.models.Request('GET', url, params=params).prepare()
-    generated_url = req.url
+    try:
+        response = requests.get("https://services.dnb.de/sru/dnb", params=params, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"HTTP-Fehler bei DNB-Anfrage: {e}")
+        return [], ""
+
+    xml_data = response.text
+    results = []
 
     try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code != 200:
-            return [], generated_url
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as e:
+        print(f"XML Parse Error: {e}")
+        return [], response.url
 
-        # Encoding absichern, bevor geparst wird - vermeidet einen harten
-        # ParseError, falls die DNB gelegentlich fehlerhaft codierte
-        # Zeichen ausliefert (z.B. kaputte Umlaute).
-        response.encoding = response.encoding or "utf-8"
-        root = ET.fromstring(response.text.encode("utf-8", errors="replace"))
+    for record in root.findall(".//{*}record"):
+        title = ""
+        year = ""
+        pages = ""
+        dnb_id = ""
 
-        records_found = []
+        persons = []
+        publisher = None
 
-        # Iteration über 'recordData' (kommt pro Treffer genau einmal vor),
-        # darin gezielt der eine innere MARC-'record' - siehe frühere Analyse
-        # zum falschen Namespace '{http://loc.gov}record'.
-        for record_data in root.findall('.//{*}recordData'):
-            marc_rec = record_data.find('.//{*}record')
-            if marc_rec is None:
-                continue
+        dnb_control = record.find("./{*}controlfield[@tag='001']")
+        if dnb_control is not None and dnb_control.text:
+            dnb_id = dnb_control.text.strip()
 
-            # DNB-ID aus Kontrollfeld tag="001" extrahieren
-            dnb_id = ""
-            id_el = marc_rec.find("./{*}controlfield[@tag='001']")
-            if id_el is not None and id_el.text:
-                dnb_id = id_el.text.strip()
+        title_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='a']")
+        if title_field is not None and title_field.text:
+            title = title_field.text.strip(" /:")
 
-            # Titel (tag="245", code="a") und Beschreibungen extrahieren
-            title_text = "Ohne Titel"
-            desc_text = ""
-            field_245 = marc_rec.find("./{*}datafield[@tag='245']")
-            if field_245 is not None:
-                a_el = field_245.find("./{*}subfield[@code='a']")
-                if a_el is not None and a_el.text:
-                    title_text = a_el.text.strip()
+        pages_field = record.find("./{*}datafield[@tag='300']/{*}subfield[@code='a']")
+        if pages_field is not None and pages_field.text:
+            pages = pages_field.text.strip()
 
-                b_el = field_245.find("./{*}subfield[@code='b']")
-                c_el = field_245.find("./{*}subfield[@code='c']")
-                desc_parts = []
-                if b_el is not None and b_el.text:
-                    desc_parts.append(b_el.text.strip())
-                if c_el is not None and c_el.text:
-                    desc_parts.append(c_el.text.strip())
-                desc_text = " | ".join(desc_parts)
+        year_field = record.find("./{*}datafield[@tag='264']/{*}subfield[@code='c']")
+        if year_field is None:
+            year_field = record.find("./{*}datafield[@tag='260']/{*}subfield[@code='c']")
+        if year_field is not None and year_field.text:
+            m = re.search(r'(\d{4})', year_field.text)
+            if m:
+                year = m.group(1)
 
-            # Personen sammeln: Haupteintragung (100) + Nebeneintragungen (700),
-            # jeweils mit Name, GND-ID, Rolle. Ersetzt die frühere getrennte
-            # Behandlung von "author" (String) und "contributors" (Stringliste).
-            persons = []
+        for field in record.findall("./{*}datafield[@tag='100']"):
+            name_el = field.find("./{*}subfield[@code='a']")
+            if name_el is not None and name_el.text:
+                persons.append({
+                    "name": name_el.text.strip(),
+                    "gnd_id": extract_gnd_id(field),
+                    "birth_death": (field.find("./{*}subfield[@code='d']").text.strip()
+                                    if field.find("./{*}subfield[@code='d']") is not None
+                                    and field.find("./{*}subfield[@code='d']").text else ""),
+                    "role": "autor",
+                    "is_primary_author": True,
+                })
 
-            field_100 = marc_rec.find("./{*}datafield[@tag='100']")
-            if field_100 is not None:
-                a_el = field_100.find("./{*}subfield[@code='a']")
-                if a_el is not None and a_el.text:
-                    d_el = field_100.find("./{*}subfield[@code='d']")
-                    e_el = field_100.find("./{*}subfield[@code='e']")
-                    persons.append({
-                        "gnd_id": extract_gnd_id(field_100),
-                        "name": a_el.text.strip(),
-                        "birth_death": d_el.text.strip() if d_el is not None and d_el.text else "",
-                        "role": e_el.text.strip() if e_el is not None and e_el.text else "Verfasser",
-                        "is_primary_author": True
-                    })
+        for field in record.findall("./{*}datafield[@tag='700']"):
+            name_el = field.find("./{*}subfield[@code='a']")
+            if name_el is not None and name_el.text:
+                role = "mitwirkender"
+                rel = field.find("./{*}subfield[@code='4']")
+                if rel is not None and rel.text:
+                    role = rel.text.strip()
+                persons.append({
+                    "name": name_el.text.strip(),
+                    "gnd_id": extract_gnd_id(field),
+                    "birth_death": (field.find("./{*}subfield[@code='d']").text.strip()
+                                    if field.find("./{*}subfield[@code='d']") is not None
+                                    and field.find("./{*}subfield[@code='d']").text else ""),
+                    "role": role,
+                    "is_primary_author": False,
+                })
 
-            for field_700 in marc_rec.findall("./{*}datafield[@tag='700']"):
-                a_el = field_700.find("./{*}subfield[@code='a']")
-                if a_el is not None and a_el.text:
-                    d_el = field_700.find("./{*}subfield[@code='d']")
-                    e_el = field_700.find("./{*}subfield[@code='e']")
-                    persons.append({
-                        "gnd_id": extract_gnd_id(field_700),
-                        "name": a_el.text.strip(),
-                        "birth_death": d_el.text.strip() if d_el is not None and d_el.text else "",
-                        "role": e_el.text.strip() if e_el is not None and e_el.text else "Mitwirkender",
-                        "is_primary_author": False
-                    })
+        pub_field = record.find("./{*}datafield[@tag='264']")
+        if pub_field is None:
+            pub_field = record.find("./{*}datafield[@tag='260']")
+        if pub_field is not None:
+            pub_name_el = pub_field.find("./{*}subfield[@code='b']")
+            if pub_name_el is not None and pub_name_el.text:
+                publisher = {
+                    "name": pub_name_el.text.strip(" ,;:"),
+                    "gnd_id": extract_gnd_id(pub_field),
+                }
 
-            # Verlag (tag="264"/"260", code="b") + Erscheinungsort (code="a")
-            # + Jahr (code="c"). Verlags-GND-ID kommt ggf. separat aus "710".
-            pub_name = ""
-            pub_gnd_id = ""
-            place_text = ""
-            year_text = "0000"
-            field_pub = marc_rec.find("./{*}datafield[@tag='264']")
-            if field_pub is None:
-                field_pub = marc_rec.find("./{*}datafield[@tag='260']")
-            if field_pub is not None:
-                a_sub = field_pub.find("./{*}subfield[@code='a']")
-                b_sub = field_pub.find("./{*}subfield[@code='b']")
-                c_sub = field_pub.find("./{*}subfield[@code='c']")
-                if a_sub is not None and a_sub.text:
-                    place_text = a_sub.text.strip()
-                if b_sub is not None and b_sub.text:
-                    pub_name = b_sub.text.strip()
-                if c_sub is not None and c_sub.text:
-                    year_match = re.search(r'\d{4}', c_sub.text)
-                    if year_match:
-                        year_text = year_match.group(0)
+        # base64-kodierte Rohdaten für Import-Button
+        payload = {
+            "dnb_id": dnb_id,
+            "title": title,
+            "year": year,
+            "pages": pages,
+            "persons": persons,
+            "publisher": publisher,
+        }
+        data_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
-            field_710 = marc_rec.find("./{*}datafield[@tag='710']")
-            if field_710 is not None:
-                gnd_from_710 = extract_gnd_id(field_710)
-                if gnd_from_710:
-                    pub_gnd_id = gnd_from_710
-                if not pub_name:
-                    a_el = field_710.find("./{*}subfield[@code='a']")
-                    if a_el is not None and a_el.text:
-                        pub_name = a_el.text.strip()
+        results.append({
+            "dnb_id": dnb_id,
+            "title": title,
+            "year": year,
+            "pages": pages,
+            "persons_text": ", ".join([p["name"] for p in persons]) if persons else "–",
+            "publisher_text": publisher["name"] if publisher else "–",
+            "data_b64": data_b64,
+        })
 
-            # Umfang/Seiten aus tag="300", code="a" extrahieren
-            pages_text = "0"
-            field_300 = marc_rec.find("./{*}datafield[@tag='300']")
-            if field_300 is not None:
-                pages_el = field_300.find("./{*}subfield[@code='a']")
-                if pages_el is not None and pages_el.text:
-                    pages_text = pages_el.text.strip()
-
-            # ISBN aus tag="020", code="a" (Bindestriche entfernt fürs saubere Matching)
-            isbn_text = ""
-            field_020 = marc_rec.find("./{*}datafield[@tag='020']")
-            if field_020 is not None:
-                isbn_el = field_020.find("./{*}subfield[@code='a']")
-                if isbn_el is not None and isbn_el.text:
-                    isbn_text = re.sub(r'[^0-9Xx]', '', isbn_el.text)
-
-            # Ausgabebezeichnung aus tag="250", code="a" (z.B. "Reprint 2020", "3. Aufl.")
-            edition_text = ""
-            field_250 = marc_rec.find("./{*}datafield[@tag='250']")
-            if field_250 is not None:
-                ed_el = field_250.find("./{*}subfield[@code='a']")
-                if ed_el is not None and ed_el.text:
-                    edition_text = ed_el.text.strip()
-
-            # Reihe aus tag="490" (bzw. Fallback 830), code="a" + Bandnummer code="v"
-            series_text = ""
-            field_series = marc_rec.find("./{*}datafield[@tag='490']")
-            if field_series is None:
-                field_series = marc_rec.find("./{*}datafield[@tag='830']")
-            if field_series is not None:
-                s_el = field_series.find("./{*}subfield[@code='a']")
-                v_el = field_series.find("./{*}subfield[@code='v']")
-                if s_el is not None and s_el.text:
-                    series_text = s_el.text.strip()
-                    if v_el is not None and v_el.text:
-                        series_text += f", {v_el.text.strip()}"
-
-            record = {
-                "id": dnb_id,
-                "title": title_text,
-                "year": year_text,
-                "pages": pages_text,
-                "description": desc_text,
-                "place": place_text,
-                "isbn": isbn_text,
-                "asin": "",  # DNB liefert keine ASIN - Feld bleibt für manuelle Nacherfassung frei
-                "edition": edition_text,
-                "series": series_text,
-                "persons": persons,
-                "publisher": {"gnd_id": pub_gnd_id, "name": pub_name} if pub_name else None,
-            }
-
-            # Anzeige-Felder fürs Template (unverändert nutzbar wie bisher)
-            primary = next((p for p in persons if p["is_primary_author"]), None)
-            record["author"] = primary["name"] if primary else "Unbekannter Autor"
-            record["contributors"] = [
-                f"{p['name']} ({p['role']})" for p in persons if not p["is_primary_author"]
-            ]
-            record["publisher_name"] = pub_name or "Unbekannt"
-
-            # Kompletten strukturierten Datensatz Base64-kodiert mitgeben, damit
-            # /import ihn ohne zweiten DNB-Request oder fragilen Server-Cache
-            # direkt normalisiert einspielen kann.
-            payload = base64.urlsafe_b64encode(json.dumps(record).encode("utf-8")).decode("ascii")
-            record["import_payload"] = payload
-
-            records_found.append(record)
-        return records_found, generated_url
-    except Exception as e:
-        print(f"Fehler bei Live-Abfrage: {e}")
-        return [], generated_url
+    return results, response.url
 
 
-def find_or_create_person(cursor, gnd_id: str, name: str, birth_death: str = "") -> int:
-    """Dedupe primär über gnd_id (stabile Normdaten-ID), sonst über den
-    Namen. Race Conditions bei zeitgleichen Imports werden bewusst nicht
+@app.get("/")
+def read_root(
+    request: Request,
+    author: str = Query(default=""),
+    title: str = Query(default=""),
+    year_start: str = Query(default=""),
+    year_end: str = Query(default=""),
+    max_records: int = Query(default=20),
+):
+    search_results = []
+    debug_url = ""
+
+    if author or title or year_start or year_end:
+        search_results, debug_url = search_dnb_live(author, title, year_start, year_end, max_records)
+
+    db_books = get_books_from_db()
+
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "author": author,
+        "title": title,
+        "year_start": year_start,
+        "year_end": year_end,
+        "max_records": max_records,
+        "search_results": search_results,
+        "db_books": db_books,
+        "debug_url": debug_url,
+    })
+
+
+def find_or_create_person(cursor, gnd_id: str, name: str, birth_death: str):
+    """Sucht Person anhand gnd_id (falls vorhanden), sonst Name-only fallback.
+    Ohne UNIQUE(name) könnte Name-only theoretisch Mehrdeutigkeiten erzeugen,
     behandelt - für dieses manuell bedienten Admin-Tool ausreichend."""
     if gnd_id:
         cursor.execute("SELECT id FROM persons WHERE gnd_id = %s;", (gnd_id,))
@@ -337,16 +293,7 @@ def find_or_create_publisher(cursor, gnd_id: str, name: str):
     return cursor.fetchone()[0]
 
 
-@app.get("/import")
-def import_to_db(data: str):
-    """Nimmt den Base64-kodierten JSON-Datensatz aus dem Suchergebnis
-    entgegen und verteilt ihn auf books / persons / publishers / book_persons."""
-    try:
-        record = json.loads(base64.urlsafe_b64decode(data.encode("ascii")).decode("utf-8"))
-    except Exception as e:
-        print(f"Fehler beim Dekodieren des Import-Datensatzes: {e}")
-        return RedirectResponse(url="/", status_code=303)
-
+def import_single_record(cursor, record: dict):
     title = record.get("title", "Ohne Titel")
     year = record.get("year") or None
     try:
@@ -357,6 +304,7 @@ def import_to_db(data: str):
     pages = record.get("pages", "")
     persons = record.get("persons", [])
     publisher = record.get("publisher")
+    dnb_id = (record.get("dnb_id") or "").strip() or None
 
     pages_match = re.search(r'\b(\d+)\s*(?:S\.|Seiten|p\.)', pages, re.IGNORECASE)
     clean_pages = pages_match.group(1) if pages_match else "0"
@@ -368,88 +316,127 @@ def import_to_db(data: str):
 
     default_price = 150.00
 
+    publisher_id = None
+    if publisher:
+        publisher_id = find_or_create_publisher(
+            cursor,
+            publisher.get("gnd_id", ""),
+            publisher.get("name", "")
+        )
+
+    # Upsert: dedupliziert über dnb_id, ansonsten matching_key
+    if dnb_id:
+        cursor.execute(
+            """
+            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (dnb_id) DO UPDATE
+            SET
+                title = EXCLUDED.title,
+                year = EXCLUDED.year,
+                matching_key = EXCLUDED.matching_key,
+                pages = EXCLUDED.pages,
+                publisher_id = EXCLUDED.publisher_id,
+                price = LEAST(books.price, EXCLUDED.price)
+            RETURNING id;
+            """,
+            (dnb_id, title, year, matching_key, pages or None, publisher_id, default_price)
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (matching_key) DO UPDATE
+            SET
+                title = EXCLUDED.title,
+                year = EXCLUDED.year,
+                pages = EXCLUDED.pages,
+                publisher_id = EXCLUDED.publisher_id,
+                price = LEAST(books.price, EXCLUDED.price)
+            RETURNING id;
+            """,
+            (None, title, year, matching_key, pages or None, publisher_id, default_price)
+        )
+
+    book_id = cursor.fetchone()[0]
+
+    for p in persons:
+        pname = (p.get("name") or "").strip()
+        if not pname:
+            continue
+        person_id = find_or_create_person(
+            cursor,
+            p.get("gnd_id", ""),
+            pname,
+            p.get("birth_death", "")
+        )
+
+        role = p.get("role", "autor") or "autor"
+        is_primary = bool(p.get("is_primary_author", False))
+
+        cursor.execute(
+            """
+            INSERT INTO book_persons (book_id, person_id, role, is_primary_author)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (book_id, person_id, role) DO UPDATE
+            SET is_primary_author = EXCLUDED.is_primary_author;
+            """,
+            (book_id, person_id, role, is_primary)
+        )
+
+
+@app.post("/import")
+def import_to_db(
+    selected_data: list[str] = Form(default=[]),
+    redirect_author: str = Form(default=""),
+    redirect_title: str = Form(default=""),
+    redirect_year_start: str = Form(default=""),
+    redirect_year_end: str = Form(default=""),
+    redirect_max_records: int = Form(default=20),
+):
+    """POST-Import für Mehrfachauswahl aus Suchergebnissen inkl. Zustandserhalt via RedirectResponse."""
+    if not selected_data:
+        q = urlencode({
+            "author": redirect_author,
+            "title": redirect_title,
+            "year_start": redirect_year_start,
+            "year_end": redirect_year_end,
+            "max_records": redirect_max_records,
+        })
+        return RedirectResponse(url=f"/?{q}", status_code=303)
+
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        publisher_id = None
-        if publisher:
-            publisher_id = find_or_create_publisher(cursor, publisher.get("gnd_id", ""), publisher.get("name", ""))
+        for data in selected_data:
+            try:
+                record = json.loads(base64.urlsafe_b64decode(data.encode("ascii")).decode("utf-8"))
+            except Exception as e:
+                print(f"Fehler beim Dekodieren eines Import-Datensatzes: {e}")
+                continue
 
-        cursor.execute("""
-            INSERT INTO books
-                (dnb_id, matching_key, title, edition, series, year, place,
-                 pages, description, isbn, asin, publisher_id, price, raw_description)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (dnb_id) DO NOTHING
-            RETURNING id;
-        """, (
-            record.get("id") or None, matching_key, title,
-            record.get("edition") or None, record.get("series") or None,
-            year, record.get("place") or None, pages,
-            record.get("description") or None, record.get("isbn") or None,
-            record.get("asin") or None, publisher_id, default_price,
-            f"DNB Import ID: {record.get('id', '')}, Umfang: {pages}"
-        ))
-        row = cursor.fetchone()
-
-        if row:
-            book_id = row[0]
-            for person in persons:
-                person_id = find_or_create_person(
-                    cursor, person.get("gnd_id", ""), person.get("name", ""), person.get("birth_death", "")
-                )
-                cursor.execute("""
-                    INSERT INTO book_persons (book_id, person_id, role, is_primary_author)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (book_id, person_id, role) DO NOTHING;
-                """, (book_id, person_id, person.get("role", ""), bool(person.get("is_primary_author"))))
+            import_single_record(cursor, record)
 
         conn.commit()
-    except psycopg2.errors.UniqueViolation:
-        # Zwei DNB-Katalogeinträge (unterschiedliche dnb_id) können denselben
-        # Fuzzy-Match-Key ergeben (z.B. zwei Katalogisate derselben Ausgabe).
-        # Das ist ein erwarteter Dedupe-Fall, kein echter Fehler - überspringen.
-        if conn:
-            conn.rollback()
-        print(f"Import übersprungen (matching_key bereits vorhanden): {matching_key}")
     except Exception as e:
+        print(f"Fehler beim Bulk-Import: {e}")
         if conn:
             conn.rollback()
-        print(f"Fehler beim DB-Import: {e}")
     finally:
         if cursor:
             cursor.close()
         if conn:
             conn.close()
 
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.get("/")
-def index(
-    request: Request,
-    author: str = Query("", description="Autor"),
-    title: str = Query("", description="Titel"),
-    year_start: str = Query("", description="Jahr von"),
-    year_end: str = Query("", description="Jahr bis"),
-    max_records: int = Query(10, description="Max. Datensätze")
-):
-    dnb_results = []
-    generated_url = ""
-    if author or title or year_start:
-        dnb_results, generated_url = search_dnb_live(author, title, year_start, year_end, max_records)
-
-    local_books = get_books_from_db()
-
-    return templates.TemplateResponse(request, "index.html", {
-        "author": author,
-        "title": title,
-        "year_start": year_start,
-        "year_end": year_end,
-        "dnb_results": dnb_results,
-        "generated_url": generated_url,
-        "local_books": local_books
+    q = urlencode({
+        "author": redirect_author,
+        "title": redirect_title,
+        "year_start": redirect_year_start,
+        "year_end": redirect_year_end,
+        "max_records": redirect_max_records,
     })
+    return RedirectResponse(url=f"/?{q}", status_code=303)
