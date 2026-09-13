@@ -288,6 +288,7 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
             "dnb_id": dnb_id,
             "title": title,
             "description": description,
+            "raw_description": raw_description,
             "edition": edition,
             "series": series,
             "contributors": contributors,
@@ -296,7 +297,7 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
             "year": year,
             "pages": pages,
             "persons": persons,
-            "publisher": publisher,
+            "publisher": publisher,   
         }
         data_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
         
@@ -407,11 +408,13 @@ def find_or_create_publisher(cursor, gnd_id: str, name: str):
 
 def import_single_record(cursor, record: dict):
     title = (record.get("title") or "Ohne Titel").strip() or "Ohne Titel"
+    description = (record.get("description") or "").strip() or None
+    raw_description = (record.get("raw_description") or "").strip() or None
+    edition = (record.get("edition") or "").strip() or None
+    place = (record.get("place") or "").strip() or None
     year = normalize_year(record.get("year"))
-
     pages_raw = record.get("pages", "")
     pages_norm = normalize_pages(pages_raw)
-
     persons = record.get("persons", [])
     publisher = record.get("publisher")
     dnb_id = (record.get("dnb_id") or "").strip() or None
@@ -436,8 +439,9 @@ def import_single_record(cursor, record: dict):
     if dnb_id:
         cursor.execute(
             """
-            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price,
+                                edition, place, description, raw_description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (dnb_id) DO UPDATE
             SET
                 title = EXCLUDED.title,
@@ -445,26 +449,37 @@ def import_single_record(cursor, record: dict):
                 matching_key = EXCLUDED.matching_key,
                 pages = EXCLUDED.pages,
                 publisher_id = EXCLUDED.publisher_id,
+                edition = COALESCE(EXCLUDED.edition, books.edition),
+                place = COALESCE(EXCLUDED.place, books.place),
+                description = COALESCE(EXCLUDED.description, books.description),
+                raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description),
                 price = LEAST(books.price, EXCLUDED.price)
             RETURNING id;
             """,
-            (dnb_id, title, year, matching_key, pages_raw or None, publisher_id, default_price)
+            (dnb_id, title, year, matching_key, pages_raw or None, publisher_id, default_price,
+             edition, place, description, raw_description)
         )
     else:
         cursor.execute(
-            """
-            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """                               
+            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price,
+                                edition, place, description, raw_description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (matching_key) DO UPDATE
             SET
                 title = EXCLUDED.title,
                 year = EXCLUDED.year,
                 pages = EXCLUDED.pages,
                 publisher_id = EXCLUDED.publisher_id,
+                edition = COALESCE(EXCLUDED.edition, books.edition),
+                place = COALESCE(EXCLUDED.place, books.place),
+                description = COALESCE(EXCLUDED.description, books.description),
+                raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description),
                 price = LEAST(books.price, EXCLUDED.price)
             RETURNING id;
             """,
-            (None, title, year, matching_key, pages_raw or None, publisher_id, default_price)
+            (None, title, year, matching_key, pages_raw or None, publisher_id, default_price,
+             edition, place, description, raw_description)
         )
 
     book_id = cursor.fetchone()[0]
