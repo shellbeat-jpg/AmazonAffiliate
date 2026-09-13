@@ -20,6 +20,15 @@
         .key { font-family: monospace; font-size: 11px; background: #e0e0e0; padding: 2px 4px; border-radius: 3px; }
         .debug-url { background: #ffebee; border: 1px dashed #c62828; padding: 10px; border-radius: 4px; font-family: monospace; word-break: break-all; color: #c62828; font-size: 13px; }
         .toolbar { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
+        .import-status {
+            margin: 10px 0 0;
+            padding: 10px 12px;
+            border-radius: 6px;
+            background: #e8f5e9;
+            border: 1px solid #a5d6a7;
+            color: #1b5e20;
+            font-size: 13px;
+        }
     </style>
 </head>
 <body>
@@ -36,6 +45,15 @@
 
         {% if debug_url %}
         <div class="debug-url"><strong>DNB API URL:</strong><br>{{ debug_url }}</div>
+        {% endif %}
+
+        {% if import_summary and import_summary.selected > 0 %}
+        <div class="import-status">
+            Import-Feedback: ausgewählt={{ import_summary.selected }},
+            importiert={{ import_summary.imported }},
+            übersprungen={{ import_summary.skipped }},
+            decode-fehler={{ import_summary.failed_decode }}
+        </div>
         {% endif %}
     </div>
 
@@ -55,7 +73,7 @@
             <table id="searchResultsTable">
                 <thead>
                     <tr>
-                        <th data-type="string">Auswahl</th>
+                        <th data-nosort="true">Auswahl</th>
                         <th data-type="string">DNB-ID</th>
                         <th data-type="string">Titel</th>
                         <th data-type="string">Autoren</th>
@@ -119,23 +137,32 @@
             return Number.isNaN(n) ? Number.NEGATIVE_INFINITY : n;
         }
 
+        function setHeaderIndicator(headers, activeIndex, dir) {
+            headers.forEach((h, i) => {
+                const base = h.getAttribute('data-label') || h.textContent.replace(/\s*[▲▼]\s*$/, '');
+                h.setAttribute('data-label', base);
+                if (i === activeIndex) {
+                    h.textContent = `${base} ${dir === 'asc' ? '▲' : '▼'}`;
+                } else {
+                    h.textContent = base;
+                }
+            });
+        }
+
         function makeTableSortable(tableId) {
             const table = document.getElementById(tableId);
             if (!table) return;
 
-            const headers = table.querySelectorAll('thead th');
+            const headers = Array.from(table.querySelectorAll('thead th'));
             const tbody = table.querySelector('tbody');
             const sortState = {};
 
             headers.forEach((th, colIndex) => {
                 th.addEventListener('click', () => {
+                    if (th.dataset.nosort === 'true') return;
+
                     const type = th.dataset.type || 'string';
                     const rows = Array.from(tbody.querySelectorAll('tr'));
-
-                    // Checkbox-Spalte nicht sinnvoll sortieren
-                    if (colIndex === 0 && tableId === 'searchResultsTable') {
-                        return;
-                    }
 
                     const nextDir = sortState[colIndex] === 'asc' ? 'desc' : 'asc';
                     sortState[colIndex] = nextDir;
@@ -157,6 +184,7 @@
                     });
 
                     rows.forEach(r => tbody.appendChild(r));
+                    setHeaderIndicator(headers, colIndex, nextDir);
                 });
             });
         }

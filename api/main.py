@@ -80,6 +80,52 @@ def extract_gnd_id(field) -> str:
     return ""
 
 
+def normalize_year(year_raw):
+    if year_raw is None:
+        return None
+    text = str(year_raw).strip()
+    if not text or text == "0000":
+        return None
+    m = re.search(r"(\d{4})", text)
+    if not m:
+        return None
+    y = int(m.group(1))
+    if y < 1000 or y > 2100:
+        return None
+    return y
+
+
+def normalize_pages(pages_raw):
+    text = (pages_raw or "").strip()
+    if not text:
+        return "0"
+
+    # Erst bevorzugte Seitennotationen
+    m = re.search(r'\b(\d+)\s*(?:S\.|Seiten|p\.)', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # Fallback: erste numerische Angabe im Feld
+    m2 = re.search(r'\b(\d{1,5})\b', text)
+    if m2:
+        return m2.group(1)
+
+    return "0"
+
+
+def build_redirect_url(author, title, year_start, year_end, max_records, import_summary=None):
+    params = {
+        "author": author,
+        "title": title,
+        "year_start": year_start,
+        "year_end": year_end,
+        "max_records": max_records,
+    }
+    if import_summary:
+        params.update(import_summary)
+    return f"/?{urlencode(params)}"
+
+
 def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max_records: int):
     cql_parts = ["MAT=books"]
     if title and title.strip():
@@ -225,6 +271,10 @@ def read_root(
     year_start: str = Query(default=""),
     year_end: str = Query(default=""),
     max_records: int = Query(default=20),
+    imported: int = Query(default=0),
+    selected: int = Query(default=0),
+    skipped: int = Query(default=0),
+    failed_decode: int = Query(default=0),
 ):
     search_results = []
     debug_url = ""
@@ -244,6 +294,12 @@ def read_root(
         "search_results": search_results,
         "db_books": db_books,
         "debug_url": debug_url,
+        "import_summary": {
+            "imported": imported,
+            "selected": selected,
+            "skipped": skipped,
+            "failed_decode": failed_decode,
+        },
     })
 
 
@@ -294,25 +350,21 @@ def find_or_create_publisher(cursor, gnd_id: str, name: str):
 
 
 def import_single_record(cursor, record: dict):
-    title = record.get("title", "Ohne Titel")
-    year = record.get("year") or None
-    try:
-        year = int(year) if year and year != "0000" else None
-    except ValueError:
-        year = None
+    title = (record.get("title") or "Ohne Titel").strip() or "Ohne Titel"
+    year = normalize_year(record.get("year"))
 
-    pages = record.get("pages", "")
+    pages_raw = record.get("pages", "")
+    pages_norm = normalize_pages(pages_raw)
+
     persons = record.get("persons", [])
     publisher = record.get("publisher")
     dnb_id = (record.get("dnb_id") or "").strip() or None
 
-    pages_match = re.search(r'\b(\d+)\s*(?:S\.|Seiten|p\.)', pages, re.IGNORECASE)
-    clean_pages = pages_match.group(1) if pages_match else "0"
     primary = next((p for p in persons if p.get("is_primary_author")), None)
-    author_for_key = primary["name"] if primary else "unbekannt"
+    author_for_key = (primary.get("name") if primary else "unbekannt") or "unbekannt"
     author_clean = re.sub(r'[^a-zA-Z]', '', author_for_key).lower()[:4]
     title_clean = re.sub(r'[^a-zA-Z]', '', title).lower()[:5]
-    matching_key = f"{author_clean}-{title_clean}-{year or 0}-{clean_pages}"
+    matching_key = f"{author_clean}-{title_clean}-{year or 0}-{pages_norm}"
 
     default_price = 150.00
 
@@ -340,7 +392,7 @@ def import_single_record(cursor, record: dict):
                 price = LEAST(books.price, EXCLUDED.price)
             RETURNING id;
             """,
-            (dnb_id, title, year, matching_key, pages or None, publisher_id, default_price)
+            (dnb_id, title, year, matching_key, pages_raw or None, publisher_id, default_price)
         )
     else:
         cursor.execute(
@@ -356,24 +408,33 @@ def import_single_record(cursor, record: dict):
                 price = LEAST(books.price, EXCLUDED.price)
             RETURNING id;
             """,
-            (None, title, year, matching_key, pages or None, publisher_id, default_price)
+            (None, title, year, matching_key, pages_raw or None, publisher_id, default_price)
         )
 
     book_id = cursor.fetchone()[0]
+
+    # Duplikate innerhalb eines Records vermeiden
+    seen_person_role = set()
 
     for p in persons:
         pname = (p.get("name") or "").strip()
         if not pname:
             continue
+
+        role = ((p.get("role") or "autor").strip().lower()) or "autor"
+        is_primary = bool(p.get("is_primary_author", False))
+
+        dedupe_key = (pname.lower(), (p.get("gnd_id") or "").strip(), role)
+        if dedupe_key in seen_person_role:
+            continue
+        seen_person_role.add(dedupe_key)
+
         person_id = find_or_create_person(
             cursor,
             p.get("gnd_id", ""),
             pname,
             p.get("birth_death", "")
         )
-
-        role = p.get("role", "autor") or "autor"
-        is_primary = bool(p.get("is_primary_author", False))
 
         cursor.execute(
             """
@@ -396,15 +457,26 @@ def import_to_db(
     redirect_max_records: int = Form(default=20),
 ):
     """POST-Import für Mehrfachauswahl aus Suchergebnissen inkl. Zustandserhalt via RedirectResponse."""
+    selected_count = len(selected_data)
+    imported_count = 0
+    skipped_count = 0
+    failed_decode_count = 0
+
     if not selected_data:
-        q = urlencode({
-            "author": redirect_author,
-            "title": redirect_title,
-            "year_start": redirect_year_start,
-            "year_end": redirect_year_end,
-            "max_records": redirect_max_records,
-        })
-        return RedirectResponse(url=f"/?{q}", status_code=303)
+        url = build_redirect_url(
+            redirect_author,
+            redirect_title,
+            redirect_year_start,
+            redirect_year_end,
+            redirect_max_records,
+            {
+                "imported": imported_count,
+                "selected": selected_count,
+                "skipped": skipped_count,
+                "failed_decode": failed_decode_count,
+            },
+        )
+        return RedirectResponse(url=url, status_code=303)
 
     conn = None
     cursor = None
@@ -417,9 +489,15 @@ def import_to_db(
                 record = json.loads(base64.urlsafe_b64decode(data.encode("ascii")).decode("utf-8"))
             except Exception as e:
                 print(f"Fehler beim Dekodieren eines Import-Datensatzes: {e}")
+                failed_decode_count += 1
                 continue
 
-            import_single_record(cursor, record)
+            try:
+                import_single_record(cursor, record)
+                imported_count += 1
+            except Exception as row_err:
+                print(f"Fehler beim Import eines Datensatzes: {row_err}")
+                skipped_count += 1
 
         conn.commit()
     except Exception as e:
@@ -432,11 +510,17 @@ def import_to_db(
         if conn:
             conn.close()
 
-    q = urlencode({
-        "author": redirect_author,
-        "title": redirect_title,
-        "year_start": redirect_year_start,
-        "year_end": redirect_year_end,
-        "max_records": redirect_max_records,
-    })
-    return RedirectResponse(url=f"/?{q}", status_code=303)
+    url = build_redirect_url(
+        redirect_author,
+        redirect_title,
+        redirect_year_start,
+        redirect_year_end,
+        redirect_max_records,
+        {
+            "imported": imported_count,
+            "selected": selected_count,
+            "skipped": skipped_count,
+            "failed_decode": failed_decode_count,
+        },
+    )
+    return RedirectResponse(url=url, status_code=303)
