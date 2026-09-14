@@ -17,7 +17,9 @@ services:
       - "4000:8000" # Leitet Port 4000 von außen auf Port 8000 im Container weiter
     depends_on:
       - database
-
+    volumes:
+      - /mnt/HC_Volume_106446438/books/app/api:/app
+      
   import-worker:
     build: ./worker
     restart: on-failure
@@ -44,4 +46,4 @@ services:
       - pgadmin_data:/var/lib/pgadmin
       
 volumes:
-  pgadmin_data: 
+  pgadmin_data:
