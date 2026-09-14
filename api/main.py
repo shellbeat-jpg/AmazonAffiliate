@@ -2,53 +2,74 @@ import xml.etree.ElementTree as ET
 import re
 import json
 import base64
-from pathlib import Path
 from urllib.parse import urlencode
+
 from fastapi import FastAPI, Query, Request, Form
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 import requests
 import psycopg2
 
+from config import (
+    BASE_DIR,
+    DB_HOST,
+    DB_NAME,
+    DB_USER,
+    DB_PASS,
+    ALLOWED_LIMITS,
+    DEFAULT_LIMIT,
+    LIMIT_OPTIONS,
+)
+
 app = FastAPI()
-
-# Pfad-Auflösung via Path (ohne os-Modul) - unabhängig vom Arbeitsverzeichnis
-BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=BASE_DIR)
-
-DB_HOST = "database"
-DB_NAME = "buecherdb"
-DB_USER = "admin"
-DB_PASS = "Speechy$2026"
 
 
 def get_db_connection():
-    return psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS)
+    return psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS
+    )
 
-
-def get_books_from_db():
+def sanitize_limit(value: str, default: str = DEFAULT_LIMIT) -> str:
+    if value is None:
+        return default
+    v = str(value).strip().upper()
+    return v if v in ALLOWED_LIMITS else default
+    
+def get_books_from_db(limit_local: str = "20"):
     """Liest den lokalen Bestand inkl. aggregierter Autorennamen aus dem
     normalisierten Schema (books + book_persons + persons)."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
+
+        base_sql = """
             SELECT
                 b.id,
                 b.title,
+                b.isbn,
                 COALESCE(
                     string_agg(DISTINCT p.name, ', ') FILTER (WHERE bp.is_primary_author),
                     'Unbekannter Autor'
                 ) AS authors,
                 b.year,
-                b.matching_key,
-                b.price
+                b.matching_key
             FROM books b
             LEFT JOIN book_persons bp ON bp.book_id = b.id
             LEFT JOIN persons p ON p.id = bp.person_id
             GROUP BY b.id
-            ORDER BY b.id DESC;
-        """)
+            ORDER BY b.id DESC
+        """
+
+        safe_limit = sanitize_limit(limit_local, "20")
+        if safe_limit == "ALL":
+            cursor.execute(base_sql + ";")
+        else:
+            cursor.execute(base_sql + " LIMIT %s;", (int(safe_limit),))
+
         books = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -56,7 +77,6 @@ def get_books_from_db():
     except Exception as e:
         print(f"Datenbankfehler beim Lesen: {e}")
         return []
-
 
 def extract_gnd_id(field) -> str:
     """Extrahiert die reine numerische GND-ID aus einem MARC-Feld.
@@ -78,8 +98,10 @@ def extract_gnd_id(field) -> str:
         if candidate:
             return candidate
     return ""
-
-
+    
+def normalize_isbn_query(raw: str) -> str:
+    return re.sub(r"[^0-9Xx]", "", (raw or "")).upper()
+    
 def normalize_year(year_raw):
     if year_raw is None:
         return None
@@ -113,35 +135,50 @@ def normalize_pages(pages_raw):
     return "0"
 
 
-def build_redirect_url(author, title, year_start, year_end, max_records, import_summary=None):
+def build_redirect_url(author, title, isbn, year_start, year_end, max_records, limit_local="20", limit_search="20", import_summary=None):
     params = {
         "author": author,
         "title": title,
+        "isbn": isbn,
         "year_start": year_start,
         "year_end": year_end,
         "max_records": max_records,
+        "limit_local": limit_local,
+        "limit_search": limit_search,
     }
     if import_summary:
         params.update(import_summary)
     return f"/?{urlencode(params)}"
 
 
-def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max_records: int):
+def search_dnb_live(author: str, title: str, isbn: str, year_start: str, year_end: str, max_records: int):
+    def _clean(s: str) -> str:
+        return (s or "").strip()
+
+    # ---- Build CQL query -----------------------------------------------------
+    author_s = _clean(author)
+    title_s = _clean(title)
+    year_start_s = _clean(year_start)
+    year_end_s = _clean(year_end)
+    isbn_clean = normalize_isbn_query(isbn)
+
     cql_parts = ["MAT=books"]
-    if title and title.strip():
-        cql_parts.append(f'TIT="{title.strip()}"')
-    if author and author.strip():
-        cql_parts.append(f'ATR="{author.strip()}"')
 
-    start_valid = year_start and year_start.strip()
-    end_valid = year_end and year_end.strip()
+    # ISBN search should not be over-constrained by TIT/ATR/JHR
+    if isbn_clean:
+        cql_parts.append(f'ISBN="{isbn_clean}"')
+    else:
+        if title_s:
+            cql_parts.append(f'TIT="{title_s}"')
+        if author_s:
+            cql_parts.append(f'ATR="{author_s}"')
 
-    if start_valid and end_valid:
-        cql_parts.append(f'JHR within "{year_start.strip()} {year_end.strip()}"')
-    elif start_valid:
-        cql_parts.append(f'JHR>="{year_start.strip()}"')
-    elif end_valid:
-        cql_parts.append(f'JHR<="{year_end.strip()}"')
+        if year_start_s and year_end_s:
+            cql_parts.append(f'JHR within "{year_start_s} {year_end_s}"')
+        elif year_start_s:
+            cql_parts.append(f'JHR>="{year_start_s}"')
+        elif year_end_s:
+            cql_parts.append(f'JHR<="{year_end_s}"')
 
     cql_query = " and ".join(cql_parts)
 
@@ -153,6 +190,7 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
         "maximumRecords": max_records,
     }
 
+    # ---- Request -------------------------------------------------------------
     try:
         response = requests.get("https://services.dnb.de/sru/dnb", params=params, timeout=30)
         response.raise_for_status()
@@ -160,109 +198,100 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
         print(f"HTTP-Fehler bei DNB-Anfrage: {e}")
         return [], ""
 
-    xml_data = response.text
-    results = []
-
+    # ---- Parse XML -----------------------------------------------------------
     try:
-        root = ET.fromstring(xml_data)
+        root = ET.fromstring(response.text)
     except ET.ParseError as e:
         print(f"XML Parse Error: {e}")
         return [], response.url
 
-    for record in root.findall(".//{*}record"):
-        title = ""
+    MARC_NS = {"marc": "http://www.loc.gov/MARC21/slim"}
+    results = []
+
+    for record in root.findall(".//marc:record", MARC_NS):
+        title_v = ""
         description = ""
         raw_description = ""
         edition = ""
         series = ""
         contributors = []
-        isbn = ""
+        isbn_v = ""
         place = ""
-        year = ""
+        year_v = ""
         pages = ""
         dnb_id = ""
         persons = []
         publisher = None
-
         # 001
         dnb_control = record.find("./{*}controlfield[@tag='001']")
         if dnb_control is not None and dnb_control.text:
             dnb_id = dnb_control.text.strip()
-
         # 245$a title, 245$b subtitle/desc
         title_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='a']")
         if title_field is not None and title_field.text:
-            title = title_field.text.strip(" /:")
-            
+            title_v = title_field.text.strip(" /:")
         # 245$a description
         desc_field = record.find("./{*}datafield[@tag='245']/{*}subfield[@code='b']")
         if desc_field is not None and desc_field.text:
             description = desc_field.text.strip(" /:")
-        
         # 520$a raw_description
         raw_desc_el = record.find("./{*}datafield[@tag='520']/{*}subfield[@code='a']")
         if raw_desc_el is not None and raw_desc_el.text:
             raw_description = raw_desc_el.text.strip()
         elif description:
             raw_description = description
-        
         # 250$a edition
         edition_field = record.find("./{*}datafield[@tag='250']/{*}subfield[@code='a']")
         if edition_field is not None and edition_field.text:
             edition = edition_field.text.strip(" /:")
-        
         # 490$a series
         series_field = record.find("./{*}datafield[@tag='490']/{*}subfield[@code='a']")
         if series_field is not None and series_field.text:
             series = series_field.text.strip(" /:")
-        
-        # ISBN 020$a
-        isbn_field = record.find("./{*}datafield[@tag='020']/{*}subfield[@code='a']")
-        if isbn_field is not None and isbn_field.text:
-            isbn = isbn_field.text.strip().split(" ")[0]
-        
+        # ISBN 020$a (all)
+        isbns = []
+        for sf in record.findall("./{*}datafield[@tag='020']/{*}subfield[@code='a']"):
+            if sf is not None and sf.text:
+                val = sf.text.strip().split(" ")[0]
+                if val:
+                    isbns.append(val)
+        isbn_v = isbns[0] if isbns else ""
         # pages 300$a
         pages_field = record.find("./{*}datafield[@tag='300']/{*}subfield[@code='a']")
         if pages_field is not None and pages_field.text:
             pages = pages_field.text.strip()
-        
         # 264 (fallback 260): place/publisher/year
-        pub_field = record.find("./{*}datafield[@tag='264']")
-        if pub_field is None:
-            pub_field = record.find("./{*}datafield[@tag='260']")
-        
+        pub_field = record.find("./{*}datafield[@tag='264']") or record.find("./{*}datafield[@tag='260']")
         if pub_field is not None:
             place_el = pub_field.find("./{*}subfield[@code='a']")
             if place_el is not None and place_el.text:
                 place = place_el.text.strip(" ,;:")
-        
+
             pub_name_el = pub_field.find("./{*}subfield[@code='b']")
             if pub_name_el is not None and pub_name_el.text:
                 publisher = {
                     "name": pub_name_el.text.strip(" ,;:"),
                     "gnd_id": extract_gnd_id(pub_field),
                 }
-        
+
             year_el = pub_field.find("./{*}subfield[@code='c']")
             if year_el is not None and year_el.text:
                 m = re.search(r"(\d{4})", year_el.text)
                 if m:
-                    year = m.group(1)
-        
+                    year_v = m.group(1)
         # authors 100 + contributors 700
         for field in record.findall("./{*}datafield[@tag='100']"):
             name_el = field.find("./{*}subfield[@code='a']")
             if name_el is not None and name_el.text:
+                d_el = field.find("./{*}subfield[@code='d']")
                 persons.append({
                     "name": name_el.text.strip(),
                     "gnd_id": extract_gnd_id(field),
-                    "birth_death": (field.find("./{*}subfield[@code='d']").text.strip()
-                                    if field.find("./{*}subfield[@code='d']") is not None
-                                    and field.find("./{*}subfield[@code='d']").text else ""),
+                    "birth_death": d_el.text.strip() if d_el is not None and d_el.text else "",
                     "role": "autor",
                     "is_primary_author": True,
                 })
-        
+
         for field in record.findall("./{*}datafield[@tag='700']"):
             name_el = field.find("./{*}subfield[@code='a']")
             if name_el is not None and name_el.text:
@@ -272,53 +301,52 @@ def search_dnb_live(author: str, title: str, year_start: str, year_end: str, max
                 rel = field.find("./{*}subfield[@code='4']")
                 if rel is not None and rel.text:
                     role = rel.text.strip()
+                d_el = field.find("./{*}subfield[@code='d']")
                 persons.append({
                     "name": cname,
                     "gnd_id": extract_gnd_id(field),
-                    "birth_death": (field.find("./{*}subfield[@code='d']").text.strip()
-                                    if field.find("./{*}subfield[@code='d']") is not None
-                                    and field.find("./{*}subfield[@code='d']").text else ""),
+                    "birth_death": d_el.text.strip() if d_el is not None and d_el.text else "",
                     "role": role,
                     "is_primary_author": False,
                 })
-        
+
         persons_text = ", ".join([p["name"] for p in persons if p.get("name")]) if persons else "–"
         publisher_text = publisher["name"] if publisher else "–"
         
         # FILTER: skip incomplete placeholder rows
-        has_core = bool(title.strip()) and (
-            bool(persons) or bool(place.strip()) or bool(year.strip()) or bool(isbn.strip())
+        has_core = bool(title_v.strip()) and (
+            bool(persons) or bool(place.strip()) or bool(year_v.strip()) or bool(isbn_v.strip())
         )
         if not has_core:
             continue
-        
+
         payload = {
             "dnb_id": dnb_id,
-            "title": title,
+            "title": title_v,
             "description": description,
             "raw_description": raw_description,
             "edition": edition,
             "series": series,
             "contributors": contributors,
-            "isbn": isbn,
+            "isbn": isbn_v,
             "place": place,
-            "year": year,
+            "year": year_v,
             "pages": pages,
             "persons": persons,
-            "publisher": publisher,   
+            "publisher": publisher,
         }
         data_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
-        
+
         results.append({
             "dnb_id": dnb_id,
-            "title": title,
+            "title": title_v,
             "description": description,
             "edition": edition,
             "series": series,
             "contributors": contributors,
-            "isbn": isbn,
+            "isbn": isbn_v,
             "place": place,
-            "year": year,
+            "year": year_v,
             "pages": pages,
             "persons_text": persons_text,
             "publisher_text": publisher_text,
@@ -333,29 +361,40 @@ def read_root(
     request: Request,
     author: str = Query(default=""),
     title: str = Query(default=""),
+    isbn: str = Query(default=""),
     year_start: str = Query(default=""),
     year_end: str = Query(default=""),
     max_records: int = Query(default=20),
+    limit_local: str = Query(default="20"),
+    limit_search: str = Query(default="20"),
     imported: int = Query(default=0),
     selected: int = Query(default=0),
     skipped: int = Query(default=0),
     failed_decode: int = Query(default=0),
 ):
     search_results = []
+    limit_local = sanitize_limit(limit_local, "20")
+    limit_search = sanitize_limit(limit_search, "20")
     debug_url = ""
 
-    if author or title or year_start or year_end:
-        search_results, debug_url = search_dnb_live(author, title, year_start, year_end, max_records)
-
-    db_books = get_books_from_db()
-
+    if author or title or isbn or year_start or year_end:
+        search_results, debug_url = search_dnb_live(author, title, isbn, year_start, year_end, max_records)
+        if str(limit_search).upper() != "ALL":
+            search_results = search_results[:int(limit_search)]
+            
+    db_books = get_books_from_db(limit_local=limit_local)
+    
     return templates.TemplateResponse("index.html", {
         "request": request,
         "author": author,
         "title": title,
+        "isbn": isbn,
         "year_start": year_start,
         "year_end": year_end,
         "max_records": max_records,
+        "limit_local": limit_local,
+        "limit_search": limit_search,
+        "limit_options": LIMIT_OPTIONS,
         "search_results": search_results,
         "db_books": db_books,
         "debug_url": debug_url,
@@ -367,7 +406,58 @@ def read_root(
         },
     })
 
+@app.post("/delete-books")
+def delete_books(
+    selected_db_ids: list[int] = Form(default=[]),
+    redirect_author: str = Form(default=""),
+    redirect_title: str = Form(default=""),
+    redirect_isbn: str = Form(default=""),
+    redirect_year_start: str = Form(default=""),
+    redirect_year_end: str = Form(default=""),
+    redirect_max_records: int = Form(default=20),
+    redirect_limit_local: str = Form(default="20"),
+    redirect_limit_search: str = Form(default="20"),
+):  
 
+    redirect_limit_local = sanitize_limit(redirect_limit_local, "20")
+    redirect_limit_search = sanitize_limit(redirect_limit_search, "20")
+    
+    params = {
+        "author": redirect_author,
+        "title": redirect_title,
+        "isbn": redirect_isbn,
+        "year_start": redirect_year_start,
+        "year_end": redirect_year_end,
+        "max_records": redirect_max_records,
+        "limit_local": redirect_limit_local,
+        "limit_search": redirect_limit_search,
+    }
+
+    if not selected_db_ids:
+        return RedirectResponse(url=f"/?{urlencode(params)}", status_code=303)
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM book_persons WHERE book_id = ANY(%s);", (selected_db_ids,))
+        cursor.execute("DELETE FROM books WHERE id = ANY(%s);", (selected_db_ids,))
+        conn.commit()
+    except Exception as e:
+        print(f"Fehler beim Löschen von Büchern: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+            
+
+    
+    return RedirectResponse(url=f"/?{urlencode(params)}", status_code=303)
+    
 def find_or_create_person(cursor, gnd_id: str, name: str, birth_death: str):
     """Sucht Person anhand gnd_id (falls vorhanden), sonst Name-only fallback.
     Ohne UNIQUE(name) könnte Name-only theoretisch Mehrdeutigkeiten erzeugen,
@@ -416,6 +506,7 @@ def find_or_create_publisher(cursor, gnd_id: str, name: str):
 
 def import_single_record(cursor, record: dict):
     title = (record.get("title") or "Ohne Titel").strip() or "Ohne Titel"
+    isbn = (record.get("isbn") or "").strip() or None
     description = (record.get("description") or "").strip() or None
     raw_description = (record.get("raw_description") or "").strip() or None
     edition = (record.get("edition") or "").strip() or None
@@ -433,8 +524,6 @@ def import_single_record(cursor, record: dict):
     title_clean = re.sub(r'[^a-zA-Z]', '', title).lower()[:5]
     matching_key = f"{author_clean}-{title_clean}-{year or 0}-{pages_norm}"
 
-    default_price = 150.00
-
     publisher_id = None
     if publisher:
         publisher_id = find_or_create_publisher(
@@ -447,12 +536,13 @@ def import_single_record(cursor, record: dict):
     if dnb_id:
         cursor.execute(
             """
-            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price,
+            INSERT INTO books (dnb_id, title, isbn, year, matching_key, pages, publisher_id,
                                 edition, place, description, raw_description)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s,  %s, %s, %s, %s, %s)
             ON CONFLICT (dnb_id) DO UPDATE
             SET
                 title = EXCLUDED.title,
+                isbn = EXCLUDED.isbn,
                 year = EXCLUDED.year,
                 matching_key = EXCLUDED.matching_key,
                 pages = EXCLUDED.pages,
@@ -460,33 +550,32 @@ def import_single_record(cursor, record: dict):
                 edition = COALESCE(EXCLUDED.edition, books.edition),
                 place = COALESCE(EXCLUDED.place, books.place),
                 description = COALESCE(EXCLUDED.description, books.description),
-                raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description),
-                price = LEAST(books.price, EXCLUDED.price)
+                raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description)
             RETURNING id;
             """,
-            (dnb_id, title, year, matching_key, pages_raw or None, publisher_id, default_price,
+            (dnb_id, title, isbn, year, matching_key, pages_raw or None, publisher_id, 
              edition, place, description, raw_description)
         )
     else:
         cursor.execute(
             """                               
-            INSERT INTO books (dnb_id, title, year, matching_key, pages, publisher_id, price,
+            INSERT INTO books (dnb_id, title, isbn, year, matching_key, pages, publisher_id, 
                                 edition, place, description, raw_description)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (matching_key) DO UPDATE
             SET
-                title = EXCLUDED.title,
+                title = EXCLUDED.title, 
+                isbn = EXCLUDED.isbn,
                 year = EXCLUDED.year,
                 pages = EXCLUDED.pages,
                 publisher_id = EXCLUDED.publisher_id,
                 edition = COALESCE(EXCLUDED.edition, books.edition),
                 place = COALESCE(EXCLUDED.place, books.place),
                 description = COALESCE(EXCLUDED.description, books.description),
-                raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description),
-                price = LEAST(books.price, EXCLUDED.price)
+                raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description)
             RETURNING id;
             """,
-            (None, title, year, matching_key, pages_raw or None, publisher_id, default_price,
+            (None, title, isbn, year, matching_key, pages_raw or None, publisher_id, 
              edition, place, description, raw_description)
         )
 
@@ -530,9 +619,12 @@ def import_single_record(cursor, record: dict):
 def import_to_db(
     selected_data: list[str] = Form(default=[]),
     redirect_author: str = Form(default=""),
-    redirect_title: str = Form(default=""),
+    redirect_title: str = Form(default=""), 
+    redirect_isbn: str = Form(default=""),
     redirect_year_start: str = Form(default=""),
     redirect_year_end: str = Form(default=""),
+    redirect_limit_local: str = Form(default="20"),
+    redirect_limit_search: str = Form(default="20"),
     redirect_max_records: int = Form(default=20),
 ):
     """POST-Import für Mehrfachauswahl aus Suchergebnissen inkl. Zustandserhalt via RedirectResponse."""
@@ -540,14 +632,19 @@ def import_to_db(
     imported_count = 0
     skipped_count = 0
     failed_decode_count = 0
+    redirect_limit_local = sanitize_limit(redirect_limit_local, "20")
+    redirect_limit_search = sanitize_limit(redirect_limit_search, "20")
 
     if not selected_data:
         url = build_redirect_url(
             redirect_author,
             redirect_title,
+            redirect_isbn,
             redirect_year_start,
-            redirect_year_end,
+            redirect_year_end, 
             redirect_max_records,
+            redirect_limit_local,
+            redirect_limit_search,
             {
                 "imported": imported_count,
                 "selected": selected_count,
@@ -592,9 +689,12 @@ def import_to_db(
     url = build_redirect_url(
         redirect_author,
         redirect_title,
+        redirect_isbn,
         redirect_year_start,
         redirect_year_end,
         redirect_max_records,
+        redirect_limit_local,
+        redirect_limit_search,
         {
             "imported": imported_count,
             "selected": selected_count,
