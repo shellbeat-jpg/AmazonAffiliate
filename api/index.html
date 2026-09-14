@@ -33,14 +33,28 @@
 </head>
 <body>
     <div class="box">
-        <h2>🔎 1. DNB-SRU Live-Suchmaske (XML Daten-Injektor)</h2>
-        <form method="get" action="/">
+        <h2>🔎 1. DNB-SRU Live-Suche</h2>
+        <form method="get" action="/"> 
             <div class="form-group"><label>Autor</label><input type="text" name="author" value="{{ author }}"></div>
             <div class="form-group"><label>Titel</label><input type="text" name="title" value="{{ title }}"></div>
+            <div class="form-group"><label>ISBN</label><input type="text" name="isbn" value="{{ isbn }}"></div>
             <div class="form-group"><label>Jahr von</label><input type="number" name="year_start" value="{{ year_start }}"></div>
             <div class="form-group"><label>Jahr bis</label><input type="number" name="year_end" value="{{ year_end }}"></div>
             <div class="form-group"><label>Max Treffer</label><input type="number" name="max_records" value="{{ max_records }}"></div>
-            <div class="form-group"><label>&nbsp;</label><button type="submit">Live suchen</button></div>
+            
+            <div class="form-group">
+              <label for="limit_search">Suchergebnisse anzeigen</label>
+              <select id="limit_search" name="limit_search">
+                {% for opt in limit_options %}
+                  <option value="{{ opt }}" {% if limit_search == opt %}selected{% endif %}>{{ opt }}</option>
+                {% endfor %}
+              </select>
+            </div>
+        
+            <!-- preserve local DB limit across search submits -->
+            <input type="hidden" name="limit_local" value="{{ limit_local }}">
+            
+            <div class="form-group"><label>&nbsp;</label><button type="submit">Suchen</button></div>
         </form>
 
         {% if debug_url %}
@@ -58,34 +72,38 @@
     </div>
 
     <div class="box">
-        <h2>📦 2. DNB-Suchergebnisse (Mehrfachauswahl + Import)</h2>
+        <h2>📦 2. DNB-Suchergebnisse</h2>
         <form method="post" action="/import">
             <input type="hidden" name="redirect_author" value="{{ author }}">
             <input type="hidden" name="redirect_title" value="{{ title }}">
+            <input type="hidden" name="redirect_isbn" value="{{ isbn }}">
             <input type="hidden" name="redirect_year_start" value="{{ year_start }}">
             <input type="hidden" name="redirect_year_end" value="{{ year_end }}">
             <input type="hidden" name="redirect_max_records" value="{{ max_records }}">
+            <input type="hidden" name="redirect_limit_local" value="{{ limit_local }}">
+            <input type="hidden" name="redirect_limit_search" value="{{ limit_search }}">
 
             <div class="toolbar">
-                <button class="btn-import" type="submit">Auswahl speichern (POST)</button>
+                <button class="btn-import" type="submit">Auswahl speichern</button>
             </div>
 
             <table id="searchResultsTable">
                 <thead>
-                    <tr>
-                        <th data-nosort="true">Auswahl</th>
+                    <tr>   
+                        <th data-nosort="true"><input type="checkbox" id="select-all-search" onclick="toggleAllSearch(this)"></th>
                         <th data-type="string">DNB-ID</th>
                         <th data-type="string">Titel</th>
                         <th data-type="string">Autoren</th>
                         <th data-type="number">Jahr</th>
                         <th data-type="number">Seiten</th>
                         <th data-type="string">Verlag</th>
+                        <th data-type="string">ISBN</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody>                      
                     {% for rec in search_results %}
-                    <tr>
-                        <td><input type="checkbox" name="selected_data" value="{{ rec.data_b64 }}"></td>
+                    <tr>    
+                        <td><input type="checkbox" class="search-row-check" name="selected_data" value="{{ rec.data_b64 }}"></td>
                         <td>{{ rec.dnb_id }}</td>
                         <td>               
                           <b>{{ rec.title }}</b><br>
@@ -100,7 +118,8 @@
                         <td>{{ rec.persons_text }}</td>  
                         <td>{{ rec.year }}</td>
                         <td>{{ rec.pages }}</td>                                                
-                        <td>{{ rec.publisher_text }}{% if rec.place and rec.publisher_text %}, {% endif %}{{ rec.place }}</td>   
+                        <td>{{ rec.publisher_text }}{% if rec.place and rec.publisher_text %}, {% endif %}{{ rec.place }}</td> 
+                        <td>{{ rec.isbn }}</td>  
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -109,34 +128,78 @@
     </div>
 
     <div class="box">
-        <h2 class="local">🗄️ 3. Lokale Datenbank (PostgreSQL)</h2>
+        <h2 class="local">🗄️ 3. PostgreSQL</h2>
+        
+        <!-- DB limit form ONLY -->
+        <form method="get" action="/" class="toolbar">
+          <label for="limit_local">DB-Einträge anzeigen</label>
+          <select id="limit_local" name="limit_local" onchange="this.form.submit()">
+            {% for opt in limit_options %}
+              <option value="{{ opt }}" {% if limit_local == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+      
+          <!-- preserve search state -->
+          <input type="hidden" name="author" value="{{ author }}">
+          <input type="hidden" name="title" value="{{ title }}">
+          <input type="hidden" name="isbn" value="{{ isbn }}">
+          <input type="hidden" name="year_start" value="{{ year_start }}">
+          <input type="hidden" name="year_end" value="{{ year_end }}">
+          <input type="hidden" name="max_records" value="{{ max_records }}">
+          <input type="hidden" name="limit_search" value="{{ limit_search }}">
+        </form>
+        
+      <!-- DELETE selected from DB -->
+      <form method="post" action="/delete-books" onsubmit="return confirm('Ausgewählte DB-Einträge wirklich löschen?');">
+        <input type="hidden" name="redirect_author" value="{{ author }}">
+        <input type="hidden" name="redirect_title" value="{{ title }}">
+        <input type="hidden" name="redirect_year_start" value="{{ year_start }}">
+        <input type="hidden" name="redirect_year_end" value="{{ year_end }}">
+        <input type="hidden" name="redirect_max_records" value="{{ max_records }}">
+        <input type="hidden" name="redirect_limit_local" value="{{ limit_local }}">
+        <input type="hidden" name="redirect_limit_search" value="{{ limit_search }}">
+    
+        <div class="toolbar">
+          <button type="submit" style="background:#b71c1c;">Ausgewählte löschen</button>
+        </div>
         <table id="localDbTable" class="local-table">
             <thead>
                 <tr>
+                    <th data-nosort="true"><input type="checkbox" id="select-all-db" onclick="toggleAllDb(this)"></th>
                     <th data-type="number">ID</th>
                     <th data-type="string">Titel</th>
                     <th data-type="string">Autoren</th>
                     <th data-type="number">Jahr</th>
                     <th data-type="string">Matching-Key</th>
-                    <th data-type="number">Preis (€)</th>
+                    <th data-type="number">ISBN</th>
                 </tr>
             </thead>
             <tbody>
-                {% for b in db_books %}
-                <tr>
-                    <td>{{ b[0] }}</td>
-                    <td>{{ b[1] }}</td>
-                    <td>{{ b[2] }}</td>
-                    <td>{{ b[3] }}</td>
-                    <td><span class="key">{{ b[4] }}</span></td>
-                    <td class="price">{{ b[5] }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
+              {% for b in db_books %}
+              <tr>
+                <td><input type="checkbox" class="db-row-check" name="selected_db_ids" value="{{ b[0] }}"></td>
+                <td>{{ b[0] }}</td>
+                <td>{{ b[1] }}</td>                   
+                <td>{{ b[3] }}</td>                
+                <td><span class="key">{{ b[4] }}</span></td>
+                <td>{{ b[5] }}</td>     
+                <td>{{ b[2] }}</td>
+              </tr>
+              {% endfor %}
+            </tbody> 
         </table>
+        </form>
     </div>
 
     <script>
+    
+        function toggleAllSearch(source) {
+          document.querySelectorAll('.search-row-check').forEach(cb => cb.checked = source.checked);
+        }
+        function toggleAllDb(source) {
+          document.querySelectorAll('.db-row-check').forEach(cb => cb.checked = source.checked);
+        }
+    
         function parseNumberLike(text) {
             if (!text) return Number.NEGATIVE_INFINITY;
             const cleaned = String(text).replace(',', '.');
