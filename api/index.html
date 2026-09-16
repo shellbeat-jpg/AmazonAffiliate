@@ -15,11 +15,41 @@
         th { background-color: #0055aa; color: white; cursor: pointer; user-select: none; }
         .local-table th { background-color: #2e7d32; }
         tr:hover { background-color: #f8fafc; }
-        .btn-import { padding: 8px 14px; background: #2e7d32; color: white; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; border: none; cursor: pointer; }
+        .btn-import { padding: 8px 14px; background: #ff06c1; color: white; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; border: none; cursor: pointer; }
         .price { font-weight: bold; color: #2e7d32; }
         .key { font-family: monospace; font-size: 11px; background: #e0e0e0; padding: 2px 4px; border-radius: 3px; }
         .debug-url { background: #ffebee; border: 1px dashed #c62828; padding: 10px; border-radius: 4px; font-family: monospace; word-break: break-all; color: #c62828; font-size: 13px; }
         .toolbar { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
+        .pager-wrap {
+          display: flex;
+          justify-content: flex-end;
+           /* margin-top: -44px;   align to import-toolbar row */
+          margin-bottom: 10px;
+        }
+        .pager {
+          display: flex;
+          align-items: center;
+        }
+        .btn-nav {
+          padding: 9px 20px;
+          border-radius: 4px;
+          border: none;
+          font-weight: bold;
+          cursor: pointer;
+          background: #0055aa;
+          color: #fff;
+        }
+        .btn-nav:disabled {
+          background: #b0b7c3;   /* greyed out */
+          color: #eef1f5;
+          cursor: not-allowed;
+        }
+        .pager-range {
+          font-size: 13px;
+          color: #444;
+          min-width: 140px;
+          text-align: center;
+        }
         .import-status {
             margin: 10px 0 0;
             padding: 10px 12px;
@@ -29,9 +59,54 @@
             color: #1b5e20;
             font-size: 13px;
         }
+        .import_form {
+            margin-top: -56px;
+        }
     </style>
 </head>
-<body>
+<body>  
+<!-- Impact-Site-Verification: 8d383866-4ef9-4e0c-8790-eedfdec956e1 -->
+    {% macro render_search_cell(col, rec) -%}
+      {% if col.key == "id" %}
+        {{ rec.dnb_id }}
+      {% elif col.key == "title_block" %}
+        <b>{{ rec.title }}</b><br>
+        <small style="color:#666">{{ rec.description }}</small>
+        {% if rec.edition %}<br><small style="color:#999">Ausgabe: {{ rec.edition }}</small>{% endif %}
+        {% if rec.series %}<br><small style="color:#999">Reihe: {{ rec.series }}</small>{% endif %}
+        {% if rec.contributors and rec.contributors|length > 0 %}
+          <br><small style="color:#999">Mitwirkende: {{ rec.contributors|join(", ") }}</small>
+        {% endif %}
+        {% if rec.isbn %}<br><small style="color:#999">ISBN: {{ rec.isbn }}</small>{% endif %}
+      {% elif col.key == "authors" %}{{ rec.persons_text }}
+      {% elif col.key == "year" %}{{ rec.year }}
+      {% elif col.key == "pages" %}{{ rec.pages }}
+      {% elif col.key == "publisher" %}{{ rec.publisher_text }}{% if rec.place and rec.publisher_text %}, {% endif %}{{ rec.place }}
+      {% elif col.key == "isbn" %}{{ rec.isbn }}
+      {% elif col.key == "matching" %}<span class="key">–</span>
+      {% elif col.key == "dnb_id" %}{{ rec.dnb_id }}
+      {% else %}–
+      {% endif %}
+    {%- endmacro %}
+
+    {% macro render_db_cell(col, b) -%}
+      {% if col.key == "id" %}{{ b[0] }}
+      {% elif col.key == "title_block" %}
+        <b>{{ b[1] }}</b><br>
+        <small style="color:#666">{{ b[8] or "" }}</small>
+        {% if b[9] %}<br><small style="color:#999">Ausgabe: {{ b[9] }}</small>{% endif %}
+        {% if b[10] %}<br><small style="color:#999">Reihe: {{ b[10] }}</small>{% endif %}
+        {% if b[2] %}<br><small style="color:#999">ISBN: {{ b[2] }}</small>{% endif %}
+      {% elif col.key == "authors" %}{{ b[3] }}
+      {% elif col.key == "year" %}{{ b[4] }}
+      {% elif col.key == "pages" %}{{ b[5] }}
+      {% elif col.key == "publisher" %}{{ b[6] }}{% if b[7] and b[6] %}, {% endif %}{{ b[7] or "" }}
+      {% elif col.key == "isbn" %}{{ b[2] }}
+      {% elif col.key == "matching" %}<span class="key">{{ b[11] }}</span>
+      {% elif col.key == "dnb_id" %}{{ b[12] }}
+      {% else %}–
+      {% endif %}
+    {%- endmacro %}
     <div class="box">
         <h2>🔎 1. DNB-SRU Live-Suche</h2>
         <form method="get" action="/"> 
@@ -40,17 +115,6 @@
             <div class="form-group"><label>ISBN</label><input type="text" name="isbn" value="{{ isbn }}"></div>
             <div class="form-group"><label>Jahr von</label><input type="number" name="year_start" value="{{ year_start }}"></div>
             <div class="form-group"><label>Jahr bis</label><input type="number" name="year_end" value="{{ year_end }}"></div>
-            <div class="form-group"><label>Max Treffer</label><input type="number" name="max_records" value="{{ max_records }}"></div>
-            
-            <div class="form-group">
-              <label for="limit_search">Suchergebnisse anzeigen</label>
-              <select id="limit_search" name="limit_search">
-                {% for opt in limit_options %}
-                  <option value="{{ opt }}" {% if limit_search == opt %}selected{% endif %}>{{ opt }}</option>
-                {% endfor %}
-              </select>
-            </div>
-        
             <!-- preserve local DB limit across search submits -->
             <input type="hidden" name="limit_local" value="{{ limit_local }}">
             
@@ -73,53 +137,72 @@
 
     <div class="box">
         <h2>📦 2. DNB-Suchergebnisse</h2>
-        <form method="post" action="/import">
+
+        {% if total_hits > 0 %}
+        <div class="pager-wrap">
+          <form method="get" class="pager" action="/">
+            <input type="hidden" name="author" value="{{ author }}">
+            <input type="hidden" name="title" value="{{ title }}">
+            <input type="hidden" name="isbn" value="{{ isbn }}">
+            <input type="hidden" name="year_start" value="{{ year_start }}">
+            <input type="hidden" name="year_end" value="{{ year_end }}">
+            <input type="hidden" name="limit_local" value="{{ limit_local }}">
+      
+            <button class="btn-nav" type="submit" name="start_record" value="{{ prev_start if prev_start else start_record }}" {% if not prev_start %}disabled{% endif %}>
+              ← Zurück
+            </button>      
+            <span class="pager-range">{{ range_start }}-{{ range_end }} von {{ total_hits }}</span>
+      
+            <button class="btn-nav" type="submit" name="start_record" value="{{ next_start if next_start else start_record }}" {% if not next_start %}disabled{% endif %}>
+              Weiter →
+            </button>
+          </form>
+        </div>
+        {% endif %}
+        
+        <form method="post" action="/import" class="import_form">
             <input type="hidden" name="redirect_author" value="{{ author }}">
             <input type="hidden" name="redirect_title" value="{{ title }}">
             <input type="hidden" name="redirect_isbn" value="{{ isbn }}">
             <input type="hidden" name="redirect_year_start" value="{{ year_start }}">
             <input type="hidden" name="redirect_year_end" value="{{ year_end }}">
-            <input type="hidden" name="redirect_max_records" value="{{ max_records }}">
             <input type="hidden" name="redirect_limit_local" value="{{ limit_local }}">
-            <input type="hidden" name="redirect_limit_search" value="{{ limit_search }}">
-
+            <input type="hidden" name="redirect_start_record" value="{{ start_record }}">
+            
             <div class="toolbar">
                 <button class="btn-import" type="submit">Auswahl speichern</button>
-            </div>
-
+            </div>       
+   
             <table id="searchResultsTable">
                 <thead>
-                    <tr>   
-                        <th data-nosort="true"><input type="checkbox" id="select-all-search" onclick="toggleAllSearch(this)"></th>
-                        <th data-type="string">DNB-ID</th>
-                        <th data-type="string">Titel</th>
-                        <th data-type="string">Autoren</th>
-                        <th data-type="number">Jahr</th>
-                        <th data-type="number">Seiten</th>
-                        <th data-type="string">Verlag</th>
-                        <th data-type="string">ISBN</th>
+                    <tr>           
+                        <th data-nosort="true"><input type="checkbox" id="select-all-search" onclick="toggleAllSearch(this)"></th> 
+                        {% for col in active_columns %}
+                          <th data-type="{{ col.type }}">{{ "DNB-ID" if col.key == "id" else col.label }}</th>
+                        {% endfor %}
+                        <th data-nosort="true">Amazon</th>
+                        <th data-nosort="true">Abebooks</th>
                     </tr>
                 </thead>
                 <tbody>                      
                     {% for rec in search_results %}
                     <tr>    
                         <td><input type="checkbox" class="search-row-check" name="selected_data" value="{{ rec.data_b64 }}"></td>
-                        <td>{{ rec.dnb_id }}</td>
-                        <td>               
-                          <b>{{ rec.title }}</b><br>
-                          <small style="color:#666">{{ rec.description }}</small>
-                          {% if rec.edition %}<br><small style="color:#999">Ausgabe: {{ rec.edition }}</small>{% endif %}
-                          {% if rec.series %}<br><small style="color:#999">Reihe: {{ rec.series }}</small>{% endif %}
-                          {% if rec.contributors and rec.contributors|length > 0 %}
-                            <br><small style="color:#999">Mitwirkende: {{ rec.contributors|join(", ") }}</small>
-                          {% endif %}
-                          {% if rec.isbn %}<br><small style="color:#999">ISBN: {{ rec.isbn }}</small>{% endif %}
-                        </td>                           
-                        <td>{{ rec.persons_text }}</td>  
-                        <td>{{ rec.year }}</td>
-                        <td>{{ rec.pages }}</td>                                                
-                        <td>{{ rec.publisher_text }}{% if rec.place and rec.publisher_text %}, {% endif %}{{ rec.place }}</td> 
-                        <td>{{ rec.isbn }}</td>  
+                          {% for col in active_columns %}
+                            <td class="{{ col.class }}">{{ render_search_cell(col, rec) }}</td>
+                          {% endfor %}   
+                          <td>
+                            <button type="button"
+                              onclick="openAmazonModal('{{ rec.persons_text|e }}','{{ rec.title|e }}','{{ rec.place|default('', true)|e }}','{{ rec.year|default('', true)|e }}')">
+                              Amazon
+                            </button>
+                          </td> 
+                          <td>
+                            <button type="button"
+                              onclick="openAbebooksModal('{{ rec.persons_text|e }}','{{ rec.title|e }}','{{ rec.place|default('', true)|e }}','{{ rec.year|default('', true)|e }}')">
+                              Abebooks
+                            </button>
+                          </td>    
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -128,8 +211,7 @@
     </div>
 
     <div class="box">
-        <h2 class="local">🗄️ 3. PostgreSQL</h2>
-        
+        <h2 class="local">🗄️ 3. Angebote</h2>
         <!-- DB limit form ONLY -->
         <form method="get" action="/" class="toolbar">
           <label for="limit_local">DB-Einträge anzeigen</label>
@@ -137,16 +219,14 @@
             {% for opt in limit_options %}
               <option value="{{ opt }}" {% if limit_local == opt %}selected{% endif %}>{{ opt }}</option>
             {% endfor %}
-          </select>
-      
+          </select>              
           <!-- preserve search state -->
           <input type="hidden" name="author" value="{{ author }}">
           <input type="hidden" name="title" value="{{ title }}">
           <input type="hidden" name="isbn" value="{{ isbn }}">
           <input type="hidden" name="year_start" value="{{ year_start }}">
           <input type="hidden" name="year_end" value="{{ year_end }}">
-          <input type="hidden" name="max_records" value="{{ max_records }}">
-          <input type="hidden" name="limit_search" value="{{ limit_search }}">
+          <input type="hidden" name="start_record" value="{{ start_record }}">
         </form>
         
       <!-- DELETE selected from DB -->
@@ -155,10 +235,9 @@
         <input type="hidden" name="redirect_title" value="{{ title }}">
         <input type="hidden" name="redirect_year_start" value="{{ year_start }}">
         <input type="hidden" name="redirect_year_end" value="{{ year_end }}">
-        <input type="hidden" name="redirect_max_records" value="{{ max_records }}">
         <input type="hidden" name="redirect_limit_local" value="{{ limit_local }}">
-        <input type="hidden" name="redirect_limit_search" value="{{ limit_search }}">
-    
+        <input type="hidden" name="redirect_start_record" value="{{ start_record }}">
+        
         <div class="toolbar">
           <button type="submit" style="background:#b71c1c;">Ausgewählte löschen</button>
         </div>
@@ -166,24 +245,37 @@
             <thead>
                 <tr>
                     <th data-nosort="true"><input type="checkbox" id="select-all-db" onclick="toggleAllDb(this)"></th>
-                    <th data-type="number">ID</th>
-                    <th data-type="string">Titel</th>
-                    <th data-type="string">Autoren</th>
-                    <th data-type="number">Jahr</th>
-                    <th data-type="string">Matching-Key</th>
-                    <th data-type="number">ISBN</th>
+                    {% for col in active_columns %}
+                      <th data-type="{{ col.type }}">{{ "ID" if col.key == "id" else col.label }}</th>
+                    {% endfor %}  
+                    <th data-nosort="true">Amazon</th> 
+                    <th data-nosort="true">Abebooks</th> 
                 </tr>
             </thead>
             <tbody>
               {% for b in db_books %}
               <tr>
                 <td><input type="checkbox" class="db-row-check" name="selected_db_ids" value="{{ b[0] }}"></td>
-                <td>{{ b[0] }}</td>
-                <td>{{ b[1] }}</td>                   
-                <td>{{ b[3] }}</td>                
-                <td><span class="key">{{ b[4] }}</span></td>
-                <td>{{ b[5] }}</td>     
-                <td>{{ b[2] }}</td>
+                {% for col in active_columns %}
+                  <td class="{{ col.class }}">{{ render_db_cell(col, b) }}</td>
+                {% endfor %}  
+                <td>
+                   {% if b[2] %}
+                  <button type="button"
+                    onclick="openAmazonModal('{{ b[3]|e }}','{{ b[1]|e }}','{{ (b[7] or '')|e }}','{{ (b[4] or '')|e }}')">
+                    Amazon
+                  </button>
+                  {% endif %} 
+                </td>
+                <td>             
+                 {% if b[2] %}
+                 <a href="https://www.abebooks.de/servlet/SearchResults?ds=20&kn={{ b[2] }}" target="_blank" rel="noopener noreferrer">
+                  <button type="button" onclick="">
+                    Abebooks
+                  </button>
+                </a> 
+                {% endif %}   
+                </td>
               </tr>
               {% endfor %}
             </tbody> 
@@ -191,7 +283,81 @@
         </form>
     </div>
 
+    <div id="amazonModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999;">
+      <div style="background:#fff; width:min(900px,95vw); max-height:90vh; overflow:auto; margin:4vh auto; padding:16px; border-radius:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="margin:0;">Amazon Creators API</h3>
+          <button type="button" onclick="closeAmazonModal()">Schließen ✕</button>
+        </div>
+        <p id="amazonKeyword" style="font-family:monospace; color:#444;"></p>
+        <pre id="amazonText" style="background:#f6f8fa; padding:10px; border-radius:6px;"></pre>
+        <div style="margin:10px 0;">
+          <button type="button" id="downloadAmazonJsonBtn" onclick="downloadAmazonJson()" disabled>JSON herunterladen</button>
+        </div>
+        <pre id="amazonJson" style="background:#111; color:#d6f5d6; padding:12px; border-radius:6px; font-size:12px;"></pre>
+      </div>
+    </div>
+    
     <script>
+        let amazonJsonData = null;
+        
+        async function openAmazonModal(author, title, place, year) {
+          const modal = document.getElementById('amazonModal');
+          const keywordEl = document.getElementById('amazonKeyword');
+          const textEl = document.getElementById('amazonText');
+          const jsonEl = document.getElementById('amazonJson');
+          const dlBtn = document.getElementById('downloadAmazonJsonBtn');
+        
+          modal.style.display = 'block';
+          keywordEl.textContent = 'Lade...';
+          textEl.textContent = '';
+          jsonEl.textContent = '';
+          dlBtn.disabled = true;
+          amazonJsonData = null;
+        
+          const form = new URLSearchParams();
+          form.set('author', author || '');
+          form.set('title', title || '');
+          form.set('place', place || '');
+          form.set('year', year || '');
+        
+          try {
+            const res = await fetch('/amazon-preview', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+              body: form.toString()
+            });
+            const data = await res.json();
+        
+            keywordEl.textContent = `Keyword: ${data.keyword || ''}`;
+            textEl.textContent = data.text || '';
+            jsonEl.textContent = data.json ? JSON.stringify(data.json, null, 2) : '(kein JSON)';
+            if (data.json) {
+              amazonJsonData = data.json;
+              dlBtn.disabled = false;
+            }
+          } catch (e) {
+            keywordEl.textContent = 'Keyword: -';
+            textEl.textContent = 'Fehler beim API-Aufruf.';
+            jsonEl.textContent = String(e);
+          }
+        }
+        
+        function closeAmazonModal() {
+          document.getElementById('amazonModal').style.display = 'none';
+        }
+        
+        function downloadAmazonJson() {
+          if (!amazonJsonData) return;
+          const blob = new Blob([JSON.stringify(amazonJsonData, null, 2)], {type: 'application/json'});
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'amazon-result.json';
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+
     
         function toggleAllSearch(source) {
           document.querySelectorAll('.search-row-check').forEach(cb => cb.checked = source.checked);
