@@ -7,23 +7,26 @@ from urllib.parse import urlencode
 from fastapi import FastAPI, Query, Request, Form
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.responses import JSONResponse
+from amazon import lookup_by_keyword         
 import requests
 import psycopg2
 
 from config import (
-    BASE_DIR,
-    DB_HOST,
-    DB_NAME,
-    DB_USER,
+    BASE_DIR, 
+    DB_HOST, 
+    DB_NAME, 
+    DB_USER, 
     DB_PASS,
-    ALLOWED_LIMITS,
-    DEFAULT_LIMIT,
+    ALLOWED_LIMITS, 
+    DEFAULT_LIMIT, 
     LIMIT_OPTIONS,
+    SRU_MAX_RECORDS,
+    TABLE_COLUMNS,
 )
 
 app = FastAPI()
 templates = Jinja2Templates(directory=BASE_DIR)
-
 
 def get_db_connection():
     return psycopg2.connect(
@@ -32,7 +35,52 @@ def get_db_connection():
         user=DB_USER,
         password=DB_PASS
     )
+    
+    
+def build_amazon_keyword(author: str, title: str, place: str, year: str) -> str:
+    a = (author or "").strip()
+    t = (title or "").strip()
+    p = (place or "").strip()
+    y = (year or "").strip()
+    if p:
+        return " ".join(x for x in [a, t, p] if x)
+    return " ".join(x for x in [a, t, y] if x)
+    
+    @app.post("/amazon-preview")
+    def amazon_preview(
+        author: str = Form(default=""),
+        title: str = Form(default=""),
+        place: str = Form(default=""),
+        year: str = Form(default="")
+    ):
+    
+    keyword = build_amazon_keyword(author, title, place, year)
 
+    try:
+        data = lookup_by_keyword(keyword)
+        if not data:
+            return JSONResponse({
+                "ok": False,
+                "keyword": keyword,
+                "text": "Keine Amazon-Daten gefunden.",
+                "json": None
+            }, status_code=200)
+
+        return JSONResponse({
+            "ok": True,
+            "keyword": keyword,
+            "text": f"Amazon-Suche erfolgreich für: {keyword}",
+            "json": data
+        })
+    except Exception as e:
+        return JSONResponse({
+            "ok": False,
+            "keyword": keyword,
+            "text": f"Amazon-Fehler: {e}",
+            "json": None
+        }, status_code=500)  
+    
+    
 def sanitize_limit(value: str, default: str = DEFAULT_LIMIT) -> str:
     if value is None:
         return default
@@ -48,19 +96,27 @@ def get_books_from_db(limit_local: str = "20"):
 
         base_sql = """
             SELECT
-                b.id,
-                b.title,
-                b.isbn,
+                b.id,                          -- 0
+                b.title,                       -- 1
+                b.isbn,                        -- 2
                 COALESCE(
                     string_agg(DISTINCT p.name, ', ') FILTER (WHERE bp.is_primary_author),
-                    'Unbekannter Autor'
-                ) AS authors,
-                b.year,
-                b.matching_key
+                    ''
+                ) AS authors,                  -- 3
+                b.year,                        -- 4
+                b.pages,                       -- 5
+                pub.name AS publisher_name,    -- 6
+                b.place,                       -- 7
+                b.description,                 -- 8
+                b.edition,                     -- 9
+                b.series,                      -- 10
+                b.matching_key,                -- 11
+                b.dnb_id                       -- 12
             FROM books b
             LEFT JOIN book_persons bp ON bp.book_id = b.id
             LEFT JOIN persons p ON p.id = bp.person_id
-            GROUP BY b.id
+            LEFT JOIN publishers pub ON pub.id = b.publisher_id
+            GROUP BY b.id, pub.name
             ORDER BY b.id DESC
         """
 
@@ -135,23 +191,22 @@ def normalize_pages(pages_raw):
     return "0"
 
 
-def build_redirect_url(author, title, isbn, year_start, year_end, max_records, limit_local="20", limit_search="20", import_summary=None):
+def build_redirect_url(author, title, isbn, year_start, year_end, start_record, limit_local="20", import_summary=None):
     params = {
         "author": author,
         "title": title,
         "isbn": isbn,
         "year_start": year_start,
         "year_end": year_end,
-        "max_records": max_records,
+        "start_record": start_record,
         "limit_local": limit_local,
-        "limit_search": limit_search,
     }
     if import_summary:
         params.update(import_summary)
     return f"/?{urlencode(params)}"
 
 
-def search_dnb_live(author: str, title: str, isbn: str, year_start: str, year_end: str, max_records: int):
+def search_dnb_live(author: str, title: str, isbn: str, year_start: str, year_end: str, start_record: int):
     def _clean(s: str) -> str:
         return (s or "").strip()
 
@@ -187,7 +242,8 @@ def search_dnb_live(author: str, title: str, isbn: str, year_start: str, year_en
         "operation": "searchRetrieve",
         "query": cql_query,
         "recordSchema": "MARC21-xml",
-        "maximumRecords": max_records,
+        "maximumRecords": SRU_MAX_RECORDS,
+        "startRecord": max(1, int(start_record or 1)),
     }
 
     # ---- Request -------------------------------------------------------------
@@ -196,15 +252,20 @@ def search_dnb_live(author: str, title: str, isbn: str, year_start: str, year_en
         response.raise_for_status()
     except requests.RequestException as e:
         print(f"HTTP-Fehler bei DNB-Anfrage: {e}")
-        return [], ""
+        return [], "", 0
 
-    # ---- Parse XML -----------------------------------------------------------
+    # ---- Parse XML -----------------------------------------------------------    
     try:
         root = ET.fromstring(response.text)
     except ET.ParseError as e:
         print(f"XML Parse Error: {e}")
-        return [], response.url
-
+        return [], response.url, 0
+        
+    total_hits = 0
+    n_el = root.find(".//{*}numberOfRecords")
+    if n_el is not None and (n_el.text or "").strip().isdigit():
+        total_hits = int(n_el.text.strip())
+        
     MARC_NS = {"marc": "http://www.loc.gov/MARC21/slim"}
     results = []
 
@@ -353,7 +414,7 @@ def search_dnb_live(author: str, title: str, isbn: str, year_start: str, year_en
             "data_b64": data_b64,
         })
 
-    return results, response.url
+    return results, response.url, total_hits
 
 
 @app.get("/")
@@ -364,23 +425,49 @@ def read_root(
     isbn: str = Query(default=""),
     year_start: str = Query(default=""),
     year_end: str = Query(default=""),
-    max_records: int = Query(default=20),
+    start_record: int = Query(default=1),
     limit_local: str = Query(default="20"),
-    limit_search: str = Query(default="20"),
     imported: int = Query(default=0),
     selected: int = Query(default=0),
     skipped: int = Query(default=0),
     failed_decode: int = Query(default=0),
 ):
+
+    if start_record < 1:
+        start_record = 1  
     search_results = []
     limit_local = sanitize_limit(limit_local, "20")
-    limit_search = sanitize_limit(limit_search, "20")
+    
+    try:
+        start_record = int(start_record)
+    except (TypeError, ValueError):
+        start_record = 1
+    if start_record < 1:
+        start_record = 1
+    
     debug_url = ""
-
+    total_hits = 0
+    
+    active_columns = sorted(
+        [c for c in TABLE_COLUMNS if c.get("visible")],
+        key=lambda c: c.get("order", 9999)
+    )
+    
     if author or title or isbn or year_start or year_end:
-        search_results, debug_url = search_dnb_live(author, title, isbn, year_start, year_end, max_records)
-        if str(limit_search).upper() != "ALL":
-            search_results = search_results[:int(limit_search)]
+        search_results, debug_url, total_hits  = search_dnb_live(author, title, isbn, year_start, year_end, start_record)
+        
+    range_start = 0
+    range_end = 0
+    prev_start = None
+    next_start = None
+
+    if total_hits > 0:
+        range_start = min(start_record, total_hits)
+        range_end = min(start_record + SRU_MAX_RECORDS - 1, total_hits)
+        if start_record > 1:
+            prev_start = max(1, start_record - SRU_MAX_RECORDS)
+        if range_end < total_hits:
+            next_start = start_record + SRU_MAX_RECORDS
             
     db_books = get_books_from_db(limit_local=limit_local)
     
@@ -391,12 +478,17 @@ def read_root(
         "isbn": isbn,
         "year_start": year_start,
         "year_end": year_end,
-        "max_records": max_records,
+        "start_record": start_record,   
+        "total_hits": total_hits,       
+        "range_start": range_start,    
+        "range_end": range_end,        
+        "prev_start": prev_start,     
+        "next_start": next_start,     
         "limit_local": limit_local,
-        "limit_search": limit_search,
         "limit_options": LIMIT_OPTIONS,
         "search_results": search_results,
         "db_books": db_books,
+        "active_columns": active_columns,
         "debug_url": debug_url,
         "import_summary": {
             "imported": imported,
@@ -414,13 +506,11 @@ def delete_books(
     redirect_isbn: str = Form(default=""),
     redirect_year_start: str = Form(default=""),
     redirect_year_end: str = Form(default=""),
-    redirect_max_records: int = Form(default=20),
     redirect_limit_local: str = Form(default="20"),
-    redirect_limit_search: str = Form(default="20"),
+    redirect_start_record: str = Form(default="1"),
 ):  
 
     redirect_limit_local = sanitize_limit(redirect_limit_local, "20")
-    redirect_limit_search = sanitize_limit(redirect_limit_search, "20")
     
     params = {
         "author": redirect_author,
@@ -428,9 +518,8 @@ def delete_books(
         "isbn": redirect_isbn,
         "year_start": redirect_year_start,
         "year_end": redirect_year_end,
-        "max_records": redirect_max_records,
         "limit_local": redirect_limit_local,
-        "limit_search": redirect_limit_search,
+        "start_record": redirect_start_record,
     }
 
     if not selected_db_ids:
@@ -510,6 +599,7 @@ def import_single_record(cursor, record: dict):
     description = (record.get("description") or "").strip() or None
     raw_description = (record.get("raw_description") or "").strip() or None
     edition = (record.get("edition") or "").strip() or None
+    series = (record.get("series") or "").strip() or None
     place = (record.get("place") or "").strip() or None
     year = normalize_year(record.get("year"))
     pages_raw = record.get("pages", "")
@@ -537,8 +627,8 @@ def import_single_record(cursor, record: dict):
         cursor.execute(
             """
             INSERT INTO books (dnb_id, title, isbn, year, matching_key, pages, publisher_id,
-                                edition, place, description, raw_description)
-            VALUES (%s, %s, %s, %s, %s, %s,  %s, %s, %s, %s, %s)
+                                edition, series, place, description, raw_description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (dnb_id) DO UPDATE
             SET
                 title = EXCLUDED.title,
@@ -548,20 +638,21 @@ def import_single_record(cursor, record: dict):
                 pages = EXCLUDED.pages,
                 publisher_id = EXCLUDED.publisher_id,
                 edition = COALESCE(EXCLUDED.edition, books.edition),
+                series = COALESCE(EXCLUDED.series, books.series),
                 place = COALESCE(EXCLUDED.place, books.place),
                 description = COALESCE(EXCLUDED.description, books.description),
                 raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description)
             RETURNING id;
             """,
             (dnb_id, title, isbn, year, matching_key, pages_raw or None, publisher_id, 
-             edition, place, description, raw_description)
+             edition, series, place, description, raw_description)
         )
     else:
         cursor.execute(
             """                               
             INSERT INTO books (dnb_id, title, isbn, year, matching_key, pages, publisher_id, 
-                                edition, place, description, raw_description)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                edition, series, place, description, raw_description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (matching_key) DO UPDATE
             SET
                 title = EXCLUDED.title, 
@@ -570,13 +661,14 @@ def import_single_record(cursor, record: dict):
                 pages = EXCLUDED.pages,
                 publisher_id = EXCLUDED.publisher_id,
                 edition = COALESCE(EXCLUDED.edition, books.edition),
+                series = COALESCE(EXCLUDED.series, books.series),
                 place = COALESCE(EXCLUDED.place, books.place),
                 description = COALESCE(EXCLUDED.description, books.description),
                 raw_description = COALESCE(EXCLUDED.raw_description, books.raw_description)
             RETURNING id;
             """,
             (None, title, isbn, year, matching_key, pages_raw or None, publisher_id, 
-             edition, place, description, raw_description)
+             edition, series, place, description, raw_description)
         )
 
     book_id = cursor.fetchone()[0]
@@ -624,8 +716,7 @@ def import_to_db(
     redirect_year_start: str = Form(default=""),
     redirect_year_end: str = Form(default=""),
     redirect_limit_local: str = Form(default="20"),
-    redirect_limit_search: str = Form(default="20"),
-    redirect_max_records: int = Form(default=20),
+    redirect_start_record: str = Form(default="1"),
 ):
     """POST-Import für Mehrfachauswahl aus Suchergebnissen inkl. Zustandserhalt via RedirectResponse."""
     selected_count = len(selected_data)
@@ -633,7 +724,6 @@ def import_to_db(
     skipped_count = 0
     failed_decode_count = 0
     redirect_limit_local = sanitize_limit(redirect_limit_local, "20")
-    redirect_limit_search = sanitize_limit(redirect_limit_search, "20")
 
     if not selected_data:
         url = build_redirect_url(
@@ -641,10 +731,9 @@ def import_to_db(
             redirect_title,
             redirect_isbn,
             redirect_year_start,
-            redirect_year_end, 
-            redirect_max_records,
+            redirect_year_end,
+            redirect_start_record,
             redirect_limit_local,
-            redirect_limit_search,
             {
                 "imported": imported_count,
                 "selected": selected_count,
@@ -692,9 +781,8 @@ def import_to_db(
         redirect_isbn,
         redirect_year_start,
         redirect_year_end,
-        redirect_max_records,
+        redirect_start_record,
         redirect_limit_local,
-        redirect_limit_search,
         {
             "imported": imported_count,
             "selected": selected_count,
