@@ -23,7 +23,6 @@ Das Schema löst flache Strukturen in ein hochgradig relationales, normalisierte
 ### 1. `books` (Kerntabelle)
 - `dnb_id` (TEXT, UNIQUE): Primärer Deduplizierungs-Schlüssel für Direkt-Importe aus dem Nationalkatalog.
 - `matching_key` (TEXT, UNIQUE): Der berechnete bibliophile Fuzzy-Match-Key für plattformübergreifenden Bestandsabgleich (Format: `[autor]-[titel]-[jahr]-[seiten]`).
-- `price` (NUMERIC(10,2)): Speichert den jeweils günstigsten am Markt ermittelten Händlerpreis (`LEAST`-Logik).
 - `search_vector` (TSVECTOR): Generierte Spalte für integrierte PostgreSQL-Volltextsuche (Titel, Reihe, Beschreibung) mit deutschem Stemming.
 
 ### 2. `persons` & `book_persons` (N:M Assoziation)
